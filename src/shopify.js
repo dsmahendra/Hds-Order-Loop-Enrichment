@@ -1,14 +1,22 @@
 const crypto = require('crypto');
 
-// Verify a Shopify webhook HMAC against the raw request body.
-function verifyWebhook(rawBody, hmacHeader) {
+// The HMAC we expect for a raw body, or null when no secret is configured.
+// Exported so a rejected webhook can be diagnosed: comparing digest prefixes
+// shows whether the secret is merely WRONG vs missing, and leaks nothing — the
+// digest is what Shopify puts in a request header, not a credential.
+function webhookDigest(rawBody) {
   const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
-  if (!secret || !hmacHeader) return false;
-
-  const digest = crypto
+  if (!secret) return null;
+  return crypto
     .createHmac('sha256', secret)
     .update(rawBody) // rawBody must be a Buffer / raw string, NOT parsed JSON
     .digest('base64');
+}
+
+// Verify a Shopify webhook HMAC against the raw request body.
+function verifyWebhook(rawBody, hmacHeader) {
+  const digest = webhookDigest(rawBody);
+  if (!digest || !hmacHeader) return false;
 
   const a = Buffer.from(digest);
   const b = Buffer.from(hmacHeader);
@@ -94,6 +102,7 @@ async function writeEnrichmentMetafield(orderId, enriched) {
 
 module.exports = {
   verifyWebhook,
+  webhookDigest,
   getNoteAttribute,
   getHdsAttributes,
   normalizeDate,
