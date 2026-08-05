@@ -2,6 +2,7 @@ const express = require('express');
 const { pool } = require('../db');
 const {
   verifyWebhook,
+  webhookDigest,
   getNoteAttribute,
   getHdsAttributes,
   normalizeDate,
@@ -18,7 +19,22 @@ router.post('/shopify/orders/create', async (req, res) => {
   const hmac = req.get('X-Shopify-Hmac-Sha256');
 
   if (!verifyWebhook(rawBody, hmac)) {
-    console.warn('[webhook] HMAC verification failed');
+    // A bare "verification failed" can't distinguish a missing secret from a
+    // wrong one, and that was costing whole debugging cycles. Digest prefixes
+    // are safe to log — the secret itself never appears.
+    const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
+    const expected = webhookDigest(rawBody);
+    console.warn(
+      '[webhook] HMAC verification failed — ' +
+        `SHOPIFY_WEBHOOK_SECRET ${secret ? `set (${secret.length} chars)` : 'MISSING'}, ` +
+        `X-Shopify-Hmac-Sha256 ${hmac ? 'present' : 'MISSING'}, ` +
+        `body ${rawBody?.length ?? 0} bytes` +
+        (expected && hmac
+          ? `, computed ${expected.slice(0, 10)}… vs received ${String(hmac).slice(0, 10)}…` +
+            ' (different ⇒ wrong secret: use the value Shopify shows on the webhook page,' +
+            ' or the app API secret key if the webhook was created by a custom app)'
+          : '')
+    );
     return res.status(401).send('invalid hmac');
   }
 
