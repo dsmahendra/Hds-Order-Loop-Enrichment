@@ -6,7 +6,7 @@ const {
   getHdsAttributes,
   normalizeDate,
 } = require('../shopify');
-const { editChargeOffset, subscriptionIdForOrder } = require('../loop');
+const { editChargeOffset, subscriptionIdForOrderRetrying } = require('../loop');
 
 const router = express.Router();
 
@@ -69,22 +69,6 @@ router.post('/shopify/orders/create', async (req, res) => {
   // (e.g. "3 Days"). We push this to Loop as the subscription's chargeOffset.
   const chargeOffset = parseChargeOffset(order);
 
-  // Resolve the subscription authoritatively via Loop's order lookup (returns
-  // the "shopify-{contractId}" id the Loop API expects), falling back to any id
-  // on the order's note attributes. Only worth doing for delivery/subscription
-  // orders. loopSubscriptionId → Loop API calls; subscriptionId → our BIGINT col.
-  let loopSubscriptionId = null;
-  if (deliveryDate || source === 'loop') {
-    try {
-      loopSubscriptionId = await subscriptionIdForOrder(orderId);
-    } catch (err) {
-      console.warn(`[webhook] Loop subscription lookup failed for order ${orderId}:`, err.message);
-    }
-  }
-  const subscriptionId = loopSubscriptionId
-    ? loopSubscriptionId.replace(/^shopify-/, '')
-    : null;
-
   // No Delivery-Date means nothing to enrich — a Loop renewal whose subscription
   // attributes weren't written in time, or a non-delivery order. Record it as
   // 'skipped' rather than dropping it silently, so the gap is visible and the
@@ -96,12 +80,15 @@ router.post('/shopify/orders/create', async (req, res) => {
       ? 'Loop renewal arrived without Delivery-Date (subscription attribute not set before charge)'
       : 'order has no Delivery-Date';
 
+  // Queue the order BEFORE touching Loop. The subscription lookup below waits on
+  // Loop's ingest lag (up to ~18s), and a restart inside that window must not
+  // lose the order. subscription_id is nullable and backfilled once resolved.
   try {
     await pool.query(
       `INSERT INTO orders_to_enrich
          (order_id, delivery_date, delivery_location_id, delivery_time, suburb,
-          status, error_message, source, subscription_id, source_attributes)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+          status, error_message, source, source_attributes)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        ON CONFLICT (order_id) DO NOTHING`,
       [
         orderId,
@@ -112,7 +99,6 @@ router.post('/shopify/orders/create', async (req, res) => {
         status,
         errorMessage,
         source,
-        subscriptionId,
         getHdsAttributes(order),
       ]
     );
@@ -126,24 +112,65 @@ router.post('/shopify/orders/create', async (req, res) => {
     console.error(`[webhook] failed to queue order ${orderId}:`, err.message);
   }
 
-  // Push the charge offset (HDS cutoff days) onto the Loop subscription so future
-  // renewals are charged at the HDS cutoff. Requires a subscription id + a value;
-  // non-blocking — a failure here never affects order processing.
-  if (loopSubscriptionId && chargeOffset != null) {
-    editChargeOffset(loopSubscriptionId, chargeOffset)
-      .then((res) =>
-        console.log(
-          `[webhook] Loop chargeOffset=${chargeOffset} set on ${loopSubscriptionId} (order ${orderId}) — response:`,
-          JSON.stringify(res)
-        )
-      )
-      .catch((err) =>
-        console.warn(
-          `[webhook] failed to set Loop chargeOffset for ${loopSubscriptionId}:`,
-          err.message
-        )
+  // Resolve the subscription via Loop's order lookup (returns the
+  // "shopify-{contractId}" id the Loop API expects). Worth doing whenever the
+  // order looks subscription-related OR carries a charge offset to push.
+  // loopSubscriptionId → Loop API calls; subscriptionId → our BIGINT column.
+  let loopSubscriptionId = null;
+  if (deliveryDate || source === 'loop' || chargeOffset != null) {
+    try {
+      loopSubscriptionId = await subscriptionIdForOrderRetrying(orderId, {
+        onRetry: (attempt, wait, err) =>
+          console.warn(
+            `[webhook] order ${orderId}: Loop lookup attempt ${attempt} failed (${err.message}) — retrying in ${wait}ms`
+          ),
+      });
+    } catch (err) {
+      console.warn(`[webhook] Loop subscription lookup failed for order ${orderId}:`, err.message);
+    }
+  } else {
+    console.log(
+      `[webhook] order ${orderId}: no Delivery-Date, not a Loop order and no Charge Offset — skipping Loop lookup`
+    );
+  }
+
+  const subscriptionId = loopSubscriptionId
+    ? loopSubscriptionId.replace(/^shopify-/, '')
+    : null;
+
+  if (subscriptionId) {
+    try {
+      await pool.query(
+        `UPDATE orders_to_enrich SET subscription_id = $2, updated_at = NOW()
+          WHERE order_id = $1 AND subscription_id IS NULL`,
+        [orderId, subscriptionId]
       );
-  } else if (chargeOffset != null && !loopSubscriptionId) {
+    } catch (err) {
+      console.warn(`[webhook] could not store subscription id for order ${orderId}:`, err.message);
+    }
+  }
+
+  // Push the charge offset (HDS cutoff days) onto the Loop subscription so future
+  // renewals are charged at the HDS cutoff. Every branch logs, so a silent
+  // no-op is never mistaken for a successful write.
+  if (loopSubscriptionId && chargeOffset != null) {
+    try {
+      const res = await editChargeOffset(loopSubscriptionId, chargeOffset);
+      console.log(
+        `[webhook] Loop chargeOffset=${chargeOffset} set on ${loopSubscriptionId} (order ${orderId}) — response:`,
+        JSON.stringify(res)
+      );
+    } catch (err) {
+      console.warn(
+        `[webhook] failed to set Loop chargeOffset for ${loopSubscriptionId}:`,
+        err.message
+      );
+    }
+  } else if (chargeOffset == null) {
+    console.log(
+      `[webhook] order ${orderId} carries no "Charge Offset" note attribute — nothing to push to Loop`
+    );
+  } else {
     console.log(
       `[webhook] order ${orderId} has chargeOffset=${chargeOffset} but no subscription — skipping Loop update`
     );
