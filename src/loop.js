@@ -1,0 +1,169 @@
+// Loop Subscriptions Admin API client.
+//
+// Docs: https://developer.loopwork.co/reference/
+//   PUT   /subscription/{id}/customAttribute   — replace custom attributes
+//   PATCH /subscription/{id}/customAttribute   — merge custom attributes
+//   PUT   /subscription/{id}/note              — replace the subscription note
+//
+// Auth is the X-Loop-Token header. Custom attributes live on the SUBSCRIPTION,
+// not on an individual upcoming order — so a renewal-specific value like
+// Delivery-Date has to be overwritten before each charge.
+
+const crypto = require('crypto');
+
+const BASE = (process.env.LOOP_API_BASE || 'https://api.loopsubscriptions.com/admin/2023-10')
+  .replace(/\/+$/, '');
+  
+// Loop documents 5 req/s per endpoint inside a 10 req/s per-domain pool. We
+// serialise calls with a minimum gap so a large renewal batch can't trip it.
+const MIN_GAP_MS = Number(process.env.LOOP_API_MIN_GAP_MS || 250);
+let chain = Promise.resolve();
+let lastCallAt = 0;
+
+function throttle(fn) {
+  const run = chain.then(async () => {
+    const wait = Math.max(0, lastCallAt + MIN_GAP_MS - Date.now());
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    lastCallAt = Date.now();
+    return fn();
+  });
+  // Keep the chain alive even when a call rejects.
+  chain = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+async function loopRequest(method, path, body) {
+  const token = process.env.LOOP_API_TOKEN;
+  if (!token) throw new Error('LOOP_API_TOKEN is not set');
+
+  return throttle(async () => {
+    const res = await fetch(`${BASE}${path}`, {
+      method,
+      headers: {
+        'X-Loop-Token': token,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+
+    const text = await res.text().catch(() => '');
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      // Non-JSON body — keep the raw text for the error message.
+    }
+
+    if (!res.ok || data?.success === false) {
+      const reason = data?.message || text.slice(0, 200) || `HTTP ${res.status}`;
+      throw new Error(`Loop ${method} ${path} failed (${res.status}): ${reason}`);
+    }
+    return data;
+  });
+}
+
+// Replace the subscription's custom attributes.
+// attributes: { 'Delivery-Date': '2026-08-14', ... }
+function putCustomAttributes(subscriptionId, attributes) {
+  return loopRequest('PUT', `/subscription/${subscriptionId}/customAttribute`, {
+    customAttributes: toPairs(attributes),
+  });
+}
+
+// Merge into the subscription's existing custom attributes, leaving others intact.
+// Preferred for our use: we only own the three Delivery-* keys and must not clobber
+// anything Loop or another app has stored on the subscription.
+function patchCustomAttributes(subscriptionId, attributes) {
+  return loopRequest('PATCH', `/subscription/${subscriptionId}/customAttribute`, {
+    customAttributes: toPairs(attributes),
+  });
+}
+
+function updateNote(subscriptionId, note) {
+  return loopRequest('PUT', `/subscription/${subscriptionId}/note`, { note });
+}
+
+// Fetch a Shopify order and its associated subscription(s) from Loop.
+//   GET /orders/shopify-{orderShopifyId}
+function readSubscriptionByOrderId(orderShopifyId) {
+  return loopRequest('GET', `/orders/shopify-${orderShopifyId}`);
+}
+
+// Resolve the Loop subscription identifier (shopify-{contractId}) for a Shopify
+// order id — the value the charge-offset / customAttribute endpoints expect.
+// Returns null when the order has no associated subscription (e.g. one-time).
+async function subscriptionIdForOrder(orderShopifyId) {
+  const res = await readSubscriptionByOrderId(orderShopifyId);
+  const subs = res?.data?.subscription;
+  const shopifyId = Array.isArray(subs) ? subs[0]?.shopifyId : undefined;
+  if (!shopifyId) return null;
+  const s = String(shopifyId);
+  return s.startsWith('shopify-') ? s : `shopify-${s}`;
+}
+
+// Set the subscription's charge offset — the number of days Loop charges BEFORE
+// the scheduled delivery date. We send the HDS cutoff-days value here so the
+// renewal is charged at the HDS cutoff.
+//
+//   PUT /subscription/{id}/chargeOffset   body: { chargeOffset: <int32> }
+//
+// NOTE: this endpoint is documented under Loop admin API v2026-04. If your
+// LOOP_API_BASE points at an older version, set it to
+// https://api.loopsubscriptions.com/admin/2026-04 (the customAttribute/note
+// endpoints exist there too).
+function editChargeOffset(subscriptionId, chargeOffset) {
+  const offset = Number(chargeOffset);
+  if (!subscriptionId) {
+    return Promise.reject(new Error('editChargeOffset: subscriptionId is required'));
+  }
+  if (!Number.isInteger(offset) || offset < 0) {
+    return Promise.reject(
+      new Error(`editChargeOffset: chargeOffset must be a non-negative integer, got ${chargeOffset}`)
+    );
+  }
+  return loopRequest('PUT', `/subscription/${subscriptionId}/chargeOffset`, {
+    chargeOffset: offset,
+  });
+}
+
+// Loop's API takes [{key, value}]; values must be strings.
+function toPairs(attributes) {
+  return Object.entries(attributes)
+    .filter(([, value]) => value !== undefined && value !== null && value !== '')
+    .map(([key, value]) => ({ key, value: String(value) }));
+}
+
+// Verify an inbound Loop webhook.
+//
+// NOTE: Loop have not yet confirmed their signing scheme. This implements the
+// usual shape (HMAC-SHA256 of the raw body, base64, in a header) with both the
+// header name and digest encoding configurable. Until it's confirmed, set
+// LOOP_WEBHOOK_VERIFY=false to accept unsigned calls — but only behind a URL
+// that isn't guessable, and switch verification on as soon as Loop confirm.
+function verifyLoopWebhook(rawBody, headerValue) {
+  if (String(process.env.LOOP_WEBHOOK_VERIFY || 'true').toLowerCase() === 'false') {
+    return true;
+  }
+
+  const secret = process.env.LOOP_WEBHOOK_SECRET;
+  if (!secret || !headerValue) return false;
+
+  const encoding = process.env.LOOP_WEBHOOK_DIGEST === 'hex' ? 'hex' : 'base64';
+  const digest = crypto.createHmac('sha256', secret).update(rawBody).digest(encoding);
+
+  const a = Buffer.from(digest);
+  const b = Buffer.from(String(headerValue));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+module.exports = {
+  putCustomAttributes,
+  patchCustomAttributes,
+  updateNote,
+  editChargeOffset,
+  readSubscriptionByOrderId,
+  subscriptionIdForOrder,
+  verifyLoopWebhook,
+  loopRequest,
+};
