@@ -56,6 +56,16 @@ async function loopRequest(method, path, body) {
     }
 
     if (!res.ok || data?.success === false) {
+      // An HTML body means we reached Loop's router but no API handler — the path
+      // doesn't exist on this API version. That's almost always a wrong
+      // LOOP_API_BASE, so say so instead of dumping a page of markup. It is also
+      // permanent: retrying cannot help.
+      if (!data && /^\s*<|Cannot (GET|POST|PUT|PATCH|DELETE)/i.test(text)) {
+        throw new Error(
+          `Loop ${method} ${path} failed (${res.status}): endpoint does not exist on ${BASE} — ` +
+            'check LOOP_API_BASE (order lookup and chargeOffset need .../admin/2026-04)'
+        );
+      }
       const reason = data?.message || text.slice(0, 200) || `HTTP ${res.status}`;
       throw new Error(`Loop ${method} ${path} failed (${res.status}): ${reason}`);
     }
@@ -145,6 +155,8 @@ function isRetryableLookupError(err) {
   const m = String(err?.message || '');
   if (/LOOP_API_TOKEN is not set/i.test(m)) return false;
   if (/\((401|403)\)/.test(m)) return false;
+  // Wrong API version / path: permanent, no matter how long we wait.
+  if (/endpoint does not exist/i.test(m)) return false;
   return /\(404\)|not found|no associated subscription|\(5\d\d\)|fetch failed|network|timeout/i.test(m);
 }
 
