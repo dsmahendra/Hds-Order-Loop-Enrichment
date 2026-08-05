@@ -102,6 +102,52 @@ async function subscriptionIdForOrder(orderShopifyId) {
   return s.startsWith('shopify-') ? s : `shopify-${s}`;
 }
 
+// Same lookup, but tolerant of Loop's ingest lag.
+//
+// Shopify's orders/create webhook fires within milliseconds of the order being
+// created, while Loop ingests that order into its own system asynchronously —
+// so GET /orders/shopify-{id} routinely 404s ("Order details not found") for the
+// first few seconds of an order's life. A single attempt at webhook time
+// therefore fails for exactly the new orders we care about, even though the same
+// lookup succeeds minutes later by hand.
+//
+// Retries only what can plausibly succeed later. A missing token or a 401 is
+// permanent: it fails fast rather than burning four more calls on it.
+async function subscriptionIdForOrderRetrying(orderShopifyId, opts = {}) {
+  const attempts = Number(opts.attempts ?? process.env.LOOP_LOOKUP_RETRIES ?? 4);
+  const backoff = Number(opts.backoffMs ?? process.env.LOOP_LOOKUP_BACKOFF_MS ?? 3000);
+  const onRetry = opts.onRetry;
+
+  let lastError;
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      const id = await subscriptionIdForOrder(orderShopifyId);
+      if (id) return id;
+      // 200 with no subscription: either a genuine one-time order, or Loop has
+      // the order but hasn't attached the contract yet. Indistinguishable here,
+      // so treat it as retryable.
+      lastError = new Error('order has no associated subscription');
+    } catch (err) {
+      if (!isRetryableLookupError(err)) throw err;
+      lastError = err;
+    }
+
+    if (i < attempts - 1) {
+      const wait = backoff * (i + 1); // 3s, 6s, 9s → ~18s of grace
+      if (onRetry) onRetry(i + 1, wait, lastError);
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+  throw lastError;
+}
+
+function isRetryableLookupError(err) {
+  const m = String(err?.message || '');
+  if (/LOOP_API_TOKEN is not set/i.test(m)) return false;
+  if (/\((401|403)\)/.test(m)) return false;
+  return /\(404\)|not found|no associated subscription|\(5\d\d\)|fetch failed|network|timeout/i.test(m);
+}
+
 // Set the subscription's charge offset — the number of days Loop charges BEFORE
 // the scheduled delivery date. We send the HDS cutoff-days value here so the
 // renewal is charged at the HDS cutoff.
@@ -164,6 +210,7 @@ module.exports = {
   editChargeOffset,
   readSubscriptionByOrderId,
   subscriptionIdForOrder,
+  subscriptionIdForOrderRetrying,
   verifyLoopWebhook,
   loopRequest,
 };

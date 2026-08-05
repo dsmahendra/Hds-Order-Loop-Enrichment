@@ -9,6 +9,7 @@
     "dev": "node --watch src/index.js",
     "migrate": "node src/migrate.js",
     "loop:check": "node src/scripts/loop-check.js",
+    "loop:update": "node src/scripts/loop-update.js",
     "test": "node --test \"test/*.test.js\""
   },
   "engines": {
