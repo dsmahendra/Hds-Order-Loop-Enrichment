@@ -7,7 +7,7 @@ const {
   getHdsAttributes,
   normalizeDate,
 } = require('../shopify');
-const { editChargeOffset, subscriptionIdForOrderRetrying } = require('../loop');
+const { editChargeOffsetRetrying, subscriptionIdForOrderRetrying } = require('../loop');
 
 const router = express.Router();
 
@@ -171,7 +171,12 @@ router.post('/shopify/orders/create', async (req, res) => {
   // no-op is never mistaken for a successful write.
   if (loopSubscriptionId && chargeOffset != null) {
     try {
-      const res = await editChargeOffset(loopSubscriptionId, chargeOffset);
+      const res = await editChargeOffsetRetrying(loopSubscriptionId, chargeOffset, {
+        onRetry: (attempt, wait, err) =>
+          console.warn(
+            `[webhook] order ${orderId}: chargeOffset attempt ${attempt} failed (${err.message}) — retrying in ${wait}ms`
+          ),
+      });
       console.log(
         `[webhook] Loop chargeOffset=${chargeOffset} set on ${loopSubscriptionId} (order ${orderId}) — response:`,
         JSON.stringify(res)
