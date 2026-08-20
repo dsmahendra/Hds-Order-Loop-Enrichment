@@ -61,7 +61,15 @@ async function fetchDeliveryOptions({ postcode, suburb }) {
 //
 // Returns { ok: true, data: { delivery_date, pack_date, production_date,
 // region, suburb, postcode, charge_date } } or { ok: false, reason }.
-async function resolveRenewalDelivery({ postcode, suburb, chargeDateEpoch, chargeDateIso }) {
+async function resolveRenewalDelivery({
+  postcode,
+  suburb,
+  chargeDateEpoch,
+  chargeDateIso,
+  scheduleId = null,
+  deliveryDay = null,
+  allowDayChange = false,
+}) {
   if (!postcode) return { ok: false, reason: 'missing postcode' };
 
   const chargeDate = toChargeDate({ epoch: chargeDateEpoch, iso: chargeDateIso });
@@ -76,11 +84,42 @@ async function resolveRenewalDelivery({ postcode, suburb, chargeDateEpoch, charg
     ? result.data.delivery_options
     : [];
 
-  // Earliest option on or after the charge date (+ lead time). Options aren't
-  // guaranteed sorted, so sort rather than trusting API order.
-  const candidates = options
+  // Options aren't guaranteed sorted, so sort rather than trusting API order.
+  const upcoming = options
     .filter((o) => o?.delivery_date && o.delivery_date >= earliest)
     .sort((a, b) => a.delivery_date.localeCompare(b.delivery_date));
+
+  // A renewal must stay on the schedule the customer picked: a Monday delivery
+  // stays a Monday delivery. Taking the earliest option overall would silently
+  // move them to whatever weekday happened to come first.
+  //
+  // schedule_id first (it pins the weekday AND the window, where one weekday has
+  // several schedules), then the weekday itself in case ids were renumbered. The
+  // weekday is never abandoned unless allowDayChange says so — moving someone's
+  // delivery to a different day of the week is worse than failing loudly.
+  const bySchedule = scheduleId
+    ? upcoming.filter((o) => String(o.schedule_id) === String(scheduleId))
+    : [];
+  const byDay = deliveryDay
+    ? upcoming.filter((o) => String(o.delivery_day).toLowerCase() === String(deliveryDay).toLowerCase())
+    : [];
+
+  let candidates = upcoming;
+  let matchedBy = 'earliest available';
+  if (bySchedule.length) {
+    candidates = bySchedule;
+    matchedBy = `schedule ${scheduleId}`;
+  } else if (byDay.length) {
+    candidates = byDay;
+    matchedBy = scheduleId ? `${deliveryDay} (schedule ${scheduleId} no longer offered)` : String(deliveryDay);
+  } else if ((scheduleId || deliveryDay) && !allowDayChange) {
+    return {
+      ok: false,
+      reason:
+        `no HDS option on or after ${earliest} for ${deliveryDay || 'schedule ' + scheduleId}` +
+        ` — the schedule may have been withdrawn (charge ${chargeDate})`,
+    };
+  }
 
   const chosen = candidates[0];
   if (!chosen) {
@@ -94,6 +133,7 @@ async function resolveRenewalDelivery({ postcode, suburb, chargeDateEpoch, charg
     ok: true,
     data: {
       charge_date: chargeDate,
+      matched_by: matchedBy,
       delivery_date: chosen.delivery_date,
       pack_date: chosen.pack_date || null,
       production_date: chosen.production_date || null,

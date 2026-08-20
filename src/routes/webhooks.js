@@ -124,7 +124,10 @@ router.post('/shopify/orders/create', async (req, res) => {
       try {
         const out = await rewriteRenewalOrder(order);
         if (!out.ok) {
-          console.warn(`[webhook] order ${orderId}: date rewrite skipped — ${out.reason}`);
+          console.warn(
+            `[webhook] order ${orderId}: date rewrite skipped — ${out.reason}` +
+              (out.schedule ? ` (schedule from ${out.schedule.derivedFrom})` : '')
+          );
         } else {
           const r = out.resolved;
           const window = out.attributes['HDS Delivery Window'] || null;
@@ -141,7 +144,8 @@ router.post('/shopify/orders/create', async (req, res) => {
 
           console.log(
             `[webhook] order ${orderId}: dates rewritten — delivery ${r.delivery_date}, ` +
-              `pack ${r.pack_date}, production ${r.production_date}` +
+              `pack ${r.pack_date}, production ${r.production_date} ` +
+              `[kept on ${r.matched_by}]` +
               (out.tag ? `, tag ${out.tag}` : '')
           );
         }

@@ -188,6 +188,49 @@ function locationFor(order) {
   return { postcode, suburb };
 }
 
+// DAY_INDEX read backwards — one day table, not two.
+function weekdayOf(isoDate) {
+  if (!isoDate) return null;
+  const d = new Date(String(isoDate).slice(0, 10) + 'T00:00:00Z');
+  if (Number.isNaN(d.getTime())) return null;
+  const name = Object.keys(DAY_INDEX).find((k) => DAY_INDEX[k] === d.getUTCDay());
+  return name ? name.charAt(0).toUpperCase() + name.slice(1) : null;
+}
+
+// Which schedule must the renewal stay on?
+//
+// A Monday delivery stays a Monday delivery, so the previous cycle's schedule is
+// the constraint. HDS Schedule ID pins both the weekday and the window (one
+// weekday can have several schedules); the weekday alone is the fallback. When
+// neither label is present the weekday is derived from the PREVIOUS delivery
+// date, which every renewal carries by definition — that staleness is exactly
+// why these orders need rewriting in the first place.
+function scheduleFor(order) {
+  const scheduleId =
+    getNoteAttribute(order, 'HDS Schedule ID') || getNoteAttribute(order, 'hds_schedule_id');
+
+  const labelledDay =
+    getNoteAttribute(order, 'HDS Delivery Day') || getNoteAttribute(order, 'hds_delivery_day');
+
+  const previousRaw =
+    getNoteAttribute(order, 'Delivery-Date') ||
+    getNoteAttribute(order, 'HDS Delivery Date') ||
+    getNoteAttribute(order, 'hds_delivery_date');
+  const previous = previousRaw ? normalizeDate(previousRaw) : null;
+
+  const deliveryDay = labelledDay || weekdayOf(previous);
+
+  return {
+    scheduleId: scheduleId || null,
+    deliveryDay: deliveryDay || null,
+    derivedFrom: labelledDay
+      ? 'HDS Delivery Day'
+      : previous
+        ? 'previous delivery ' + previous
+        : 'nothing',
+  };
+}
+
 // Recompute a renewal's dates from the ORDER's own date and write them back.
 //
 // This is the whole Arigato replacement: resolve against HDS using the order date
@@ -205,12 +248,15 @@ async function rewriteRenewalOrder(order, { dryRun = false } = {}) {
   const orderDate = String(order.created_at || '').slice(0, 10);
   if (!orderDate) return { ok: false, reason: 'order has no created_at to resolve against' };
 
+  const schedule = scheduleFor(order);
   const result = await resolveRenewalDelivery({
     postcode,
     suburb,
     chargeDateIso: order.created_at,
+    scheduleId: schedule.scheduleId,
+    deliveryDay: schedule.deliveryDay,
   });
-  if (!result.ok) return { ok: false, reason: result.reason };
+  if (!result.ok) return { ok: false, reason: result.reason, schedule };
 
   const resolved = result.data;
   const attributes = buildOrderAttributes(resolved, {
@@ -218,7 +264,7 @@ async function rewriteRenewalOrder(order, { dryRun = false } = {}) {
   });
   const tag = packDateTag(resolved.pack_date);
 
-  if (dryRun) return { ok: true, dryRun: true, resolved, attributes, tag, orderDate };
+  if (dryRun) return { ok: true, dryRun: true, resolved, attributes, tag, orderDate, schedule };
 
   await updateOrderAttributes(orderId, {
     attributes,
@@ -227,11 +273,13 @@ async function rewriteRenewalOrder(order, { dryRun = false } = {}) {
     order,
   });
 
-  return { ok: true, resolved, attributes, tag, orderDate };
+  return { ok: true, resolved, attributes, tag, orderDate, schedule };
 }
 
 module.exports = {
   needsRewrite,
+  scheduleFor,
+  weekdayOf,
   timeRangeForWindow,
   rewriteRenewalOrder,
   buildOrderAttributes,

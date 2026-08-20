@@ -79,8 +79,15 @@ async function runOne(orderId, opts) {
   }
 
   const out = await rewriteRenewalOrder(order, { dryRun: opts.dryRun });
-  if (!out.ok) throw new Error(out.reason);
+  if (!out.ok) {
+    throw new Error(out.reason + (out.schedule ? ` (schedule from ${out.schedule.derivedFrom})` : ''));
+  }
 
+  console.log(
+    `  keeping        : ${out.schedule.deliveryDay || '?'} deliveries` +
+      ` (schedule ${out.schedule.scheduleId || 'n/a'}, from ${out.schedule.derivedFrom})` +
+      ` -> matched on ${out.resolved.matched_by}`
+  );
   console.log('  new values     :');
   for (const [k, v] of Object.entries(out.attributes)) console.log(`     ${k} = ${v}`);
   if (out.tag) console.log(`     tag: ${out.tag}`);

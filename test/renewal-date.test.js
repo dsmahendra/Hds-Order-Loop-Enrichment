@@ -38,6 +38,81 @@ test('addDays rolls across month boundaries in UTC', () => {
   assert.equal(addDays('2026-08-30', 0), '2026-08-30');
 });
 
+// A renewal must stay on the schedule the customer picked: a Monday delivery is
+// always a Monday delivery. Taking the earliest option overall would move them
+// onto whatever weekday happened to come first.
+const WEEKDAY_OPTIONS = [
+  { schedule_id: 1, delivery_day: 'Monday', delivery_date: '2026-08-24', pack_date: '2026-08-23', production_date: '2026-08-22', cutoff_info: 'Friday 11 PM' },
+  { schedule_id: 8, delivery_day: 'Friday', delivery_date: '2026-08-21', pack_date: '2026-08-20', production_date: '2026-08-19', cutoff_info: 'Tuesday 11 PM' },
+  { schedule_id: 1, delivery_day: 'Monday', delivery_date: '2026-08-31', pack_date: '2026-08-30', production_date: '2026-08-29', cutoff_info: 'Friday 11 PM' },
+  { schedule_id: 4, delivery_day: 'Monday', delivery_date: '2026-08-24', pack_date: '2026-08-23', production_date: '2026-08-22', cutoff_info: 'Friday 11 PM' },
+];
+
+const resolveWith = async (args) => {
+  const originalFetch = global.fetch;
+  global.fetch = stubOptions(WEEKDAY_OPTIONS);
+  try {
+    return await resolveRenewalDelivery({
+      postcode: '2026',
+      suburb: 'Bondi',
+      chargeDateIso: '2026-08-19T12:00:00Z',
+      ...args,
+    });
+  } finally {
+    global.fetch = originalFetch;
+  }
+};
+
+test('a Monday subscription gets the following Monday, not the sooner Friday', async () => {
+  const result = await resolveWith({ deliveryDay: 'Monday' });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.delivery_date, '2026-08-24');
+  // The Sunday before it — the pack date for that schedule.
+  assert.equal(result.data.pack_date, '2026-08-23');
+  assert.equal(result.data.matched_by, 'Monday');
+});
+
+test('a Friday subscription gets the Friday even though a Monday is also open', async () => {
+  const result = await resolveWith({ deliveryDay: 'Friday' });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.delivery_date, '2026-08-21');
+  assert.equal(result.data.pack_date, '2026-08-20');
+});
+
+test('schedule_id wins over the weekday, pinning the window too', async () => {
+  // Schedules 1 and 4 both deliver Monday 08-24; the id decides which.
+  const result = await resolveWith({ scheduleId: 4, deliveryDay: 'Monday' });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.schedule_id, 4);
+  assert.equal(result.data.matched_by, 'schedule 4');
+});
+
+test('a withdrawn schedule id falls back to the same weekday', async () => {
+  const result = await resolveWith({ scheduleId: 99, deliveryDay: 'Monday' });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.delivery_date, '2026-08-24');
+  assert.match(result.data.matched_by, /Monday \(schedule 99 no longer offered\)/);
+});
+
+test('an unavailable weekday fails loudly rather than moving the delivery day', async () => {
+  const result = await resolveWith({ deliveryDay: 'Tuesday' });
+
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /no HDS option on or after 2026-08-19 for Tuesday/);
+});
+
+test('allowDayChange opts in to the earliest option when the weekday is gone', async () => {
+  const result = await resolveWith({ deliveryDay: 'Tuesday', allowDayChange: true });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.delivery_date, '2026-08-21');
+  assert.equal(result.data.matched_by, 'earliest available');
+});
+
 test('picks the earliest delivery option on or after the charge date', async () => {
   const originalFetch = global.fetch;
   global.fetch = stubOptions([
