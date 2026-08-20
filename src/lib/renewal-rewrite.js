@@ -149,7 +149,7 @@ function buildOrderAttributes(resolved, { preferredWindow = null } = {}) {
     'HDS Cutoff Day': cutoff.cutoff_day,
     'HDS Cutoff Date': toSlashDate(cutoff.cutoff_date),
     'Charge Offset': cutoff.charge_offset_days == null ? null : `${cutoff.charge_offset_days} Days`,
-    'HDS Pack Date': toSlashDate(resolved.pack_date),
+    'HDS Ship Date': toSlashDate(resolved.pack_date),
     'HDS Production Date': toSlashDate(resolved.production_date),
     'HDS Region': resolved.region,
     'HDS Suburb': resolved.suburb,
@@ -172,6 +172,10 @@ function packDateTag(packDate) {
 }
 
 const PACK_TAG_PREFIX = 'Pick-Pack-Date-';
+
+// Renamed keys. The rewrite removes these so a stale value cannot sit alongside
+// its replacement, leaving downstream unable to tell which one is authoritative.
+const SUPERSEDED_ATTRIBUTES = ['HDS Pack Date'];
 
 // Where to read the suburb/postcode for the HDS lookup.
 //
@@ -265,7 +269,7 @@ function previousTuple(order) {
   };
 
   const delivery = read('Delivery-Date', 'HDS Delivery Date', 'hds_delivery_date');
-  const pack = read('Pick-Pack-Date', 'HDS Pack Date', 'hds_pack_date');
+  const pack = read('Pick-Pack-Date', 'HDS Ship Date', 'HDS Pack Date', 'hds_pack_date');
   const production = read('HDS Production Date', 'hds_production_date');
 
   return {
@@ -380,6 +384,25 @@ async function rewriteRenewalOrder(order, { dryRun = false } = {}) {
   }
 
   const resolved = result.data;
+
+  // For a renewal the cutoff IS the order date: Loop charges at the cutoff, so the
+  // moment the order exists is the moment the cycle closed. Deriving it from the
+  // delivery date instead would only restate the schedule, and would disagree with
+  // reality whenever a subscription's charge offset is not yet correct.
+  //
+  // Charge Offset stays the SCHEDULE's value (3 days NSW, 4 VIC) rather than
+  // delivery-minus-order-date: that is what we push to Loop to fix future charges,
+  // so deriving it from a charge that fired on the wrong day would preserve the
+  // error instead of correcting it.
+  if (!usedFallback) {
+    const scheduleCutoff = cutoffFor(resolved.option);
+    resolved.cutoff_override = {
+      cutoff_date: orderDate,
+      cutoff_day: weekdayOf(orderDate),
+      charge_offset_days: scheduleCutoff.charge_offset_days,
+    };
+  }
+
   const attributes = buildOrderAttributes(resolved, {
     preferredWindow: getNoteAttribute(order, 'HDS Delivery Window'),
   });
@@ -391,6 +414,7 @@ async function rewriteRenewalOrder(order, { dryRun = false } = {}) {
     attributes,
     addTags: tag ? [tag] : [],
     removeTagPrefixes: [PACK_TAG_PREFIX],
+    removeAttributes: SUPERSEDED_ATTRIBUTES,
     order,
   });
 
@@ -399,6 +423,7 @@ async function rewriteRenewalOrder(order, { dryRun = false } = {}) {
 
 module.exports = {
   needsRewrite,
+  SUPERSEDED_ATTRIBUTES,
   isPostcodeShaped,
   previousTuple,
   fallbackFromWeekdayMath,
