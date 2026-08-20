@@ -74,7 +74,13 @@ function shopifyRequest(method, path, body) {
   const store = process.env.SHOPIFY_STORE;
   const token = process.env.SHOPIFY_ADMIN_TOKEN;
   const version = process.env.SHOPIFY_API_VERSION || '2024-01';
-  if (!store || !token) throw new Error('SHOPIFY_STORE / SHOPIFY_ADMIN_TOKEN not set');
+  if (!store || !token) {
+    const missing = [!store && 'SHOPIFY_STORE', !token && 'SHOPIFY_ADMIN_TOKEN'].filter(Boolean);
+    throw new Error(
+      `${missing.join(' and ')} not set — the Admin API cannot be reached. ` +
+        'Copy the values from Railway (Variables tab) into your local .env, or run this on the Railway shell.'
+    );
+  }
 
   return fetch(`https://${store}/admin/api/${version}${path}`, {
     method,
