@@ -80,6 +80,44 @@ function needsRewrite(order) {
   return { stale: false, reason: `Delivery-Date ${delivery} is on/after the order date ${orderDate}`, current: delivery };
 }
 
+// Delivery-Time is a clock range ("12:00 AM - 7:00 AM"), but HDS only knows window
+// NAMES ("AM", "Business Hours") — the range lives in the checkout extension. So
+// the mapping is configuration, not something to infer: supply it as JSON in
+// DELIVERY_WINDOW_TIMES and the rewrite keeps Delivery-Time in step with the
+// window. Left unset, the order keeps whatever it already carries, which stays
+// correct because the window itself is preserved wherever the schedule offers it.
+let windowTimesCache;
+let windowTimesWarned = false;
+
+function windowTimes() {
+  const raw = process.env.DELIVERY_WINDOW_TIMES || '';
+  if (windowTimesCache && windowTimesCache.raw === raw) return windowTimesCache.map;
+
+  let map = {};
+  if (raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') map = parsed;
+    } catch (err) {
+      if (!windowTimesWarned) {
+        console.warn(`[rewrite] DELIVERY_WINDOW_TIMES is not valid JSON, ignoring it: ${err.message}`);
+        windowTimesWarned = true;
+      }
+    }
+  }
+  windowTimesCache = { raw, map };
+  return map;
+}
+
+function timeRangeForWindow(window) {
+  if (!window) return null;
+  const map = windowTimes();
+  if (map[window]) return map[window];
+  // Tolerate casing drift between the schedule and the configured keys.
+  const hit = Object.keys(map).find((k) => k.toLowerCase() === String(window).toLowerCase());
+  return hit ? map[hit] : null;
+}
+
 // The note attributes to write back, in the exact spellings already on the order.
 //
 // Deliberately NOT included: Delivery-Time, Delivery-Location-Id, Delivery-Slot-Id,
@@ -94,6 +132,8 @@ function buildOrderAttributes(resolved, { preferredWindow = null } = {}) {
     // What the downstream integration reads.
     'Delivery-Date': toSlashDate(resolved.delivery_date),
     'Pick-Pack-Date': toSlashDate(resolved.pack_date),
+    // Only when DELIVERY_WINDOW_TIMES maps this window; otherwise left untouched.
+    'Delivery-Time': timeRangeForWindow(window),
     // The labelled HDS set, as the checkout extension writes it.
     'HDS Delivery Date': toSlashDate(resolved.delivery_date),
     'HDS Delivery Formatted': resolved.formatted_date,
@@ -192,6 +232,7 @@ async function rewriteRenewalOrder(order, { dryRun = false } = {}) {
 
 module.exports = {
   needsRewrite,
+  timeRangeForWindow,
   rewriteRenewalOrder,
   buildOrderAttributes,
   packDateTag,
