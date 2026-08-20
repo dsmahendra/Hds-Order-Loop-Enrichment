@@ -16,6 +16,12 @@
 
 const { getNoteAttribute, normalizeDate, updateOrderAttributes } = require('../shopify');
 const { chooseDeliveryWindow, resolveRenewalDelivery } = require('./renewal-date');
+const {
+  calculateNextDeliveryDate,
+  formatLongDate,
+  daysBetween,
+  subtractDays,
+} = require('./next-delivery');
 
 const DAY_INDEX = {
   sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6,
@@ -125,7 +131,7 @@ function timeRangeForWindow(window) {
 // other apps — HDS has no authority over them, and the write merges rather than
 // replaces so they survive untouched.
 function buildOrderAttributes(resolved, { preferredWindow = null } = {}) {
-  const cutoff = cutoffFor(resolved.option);
+  const cutoff = resolved.cutoff_override || cutoffFor(resolved.option);
   const window = chooseDeliveryWindow(resolved, preferredWindow);
 
   const out = {
@@ -231,6 +237,98 @@ function scheduleFor(order) {
   };
 }
 
+// The previous cycle's tuple, and the gaps between its dates.
+//
+// The stale attributes are the one thing every renewal is guaranteed to carry, so
+// they are a usable source for the SHAPE of the schedule even though the dates
+// themselves are expired: delivery->pack was 1 day in NSW and 2 in VIC, so
+// carrying that gap forward is region-correct by construction rather than by a
+// hardcoded rule.
+function previousTuple(order) {
+  const read = (...names) => {
+    for (const n of names) {
+      const v = getNoteAttribute(order, n);
+      if (v) return normalizeDate(v);
+    }
+    return null;
+  };
+
+  const delivery = read('Delivery-Date', 'HDS Delivery Date', 'hds_delivery_date');
+  const pack = read('Pick-Pack-Date', 'HDS Pack Date', 'hds_pack_date');
+  const production = read('HDS Production Date', 'hds_production_date');
+
+  return {
+    delivery,
+    pack,
+    production,
+    packGap: daysBetween(delivery, pack),
+    productionGap: daysBetween(delivery, production),
+    chargeOffset: parseOffsetDays(getNoteAttribute(order, 'Charge Offset')),
+  };
+}
+
+function parseOffsetDays(raw) {
+  if (raw == null) return null;
+  const m = String(raw).match(/\d+/);
+  return m ? Number(m[0]) : null;
+}
+
+// Weekday arithmetic instead of an HDS lookup: next occurrence of the customer's
+// delivery weekday on or after the order date, with pack/production carried
+// forward at the same gaps as their previous cycle and the cutoff derived from
+// their Charge Offset.
+//
+// Opt-in (FALLBACK_WEEKDAY_MATH), and off by default for a real reason: HDS omits
+// options whose production cutoff has already passed, and this does not. Asked
+// for a Friday on 2026-08-19 it returns 2026-08-21, whose Tuesday cutoff was
+// already gone — HDS correctly answers 2026-08-28. So this can promise the
+// kitchen something it cannot make, and is only worth using when HDS has no
+// schedule for that weekday at all.
+function fallbackFromWeekdayMath(order, schedule) {
+  if (String(process.env.FALLBACK_WEEKDAY_MATH || 'false').toLowerCase() !== 'true') {
+    return { ok: false, reason: 'weekday-math fallback is disabled (FALLBACK_WEEKDAY_MATH)' };
+  }
+  if (!schedule.deliveryDay) {
+    return { ok: false, reason: 'no delivery weekday to compute from' };
+  }
+
+  const previous = previousTuple(order);
+  const orderDate = String(order.created_at || '').slice(0, 10);
+  const next = calculateNextDeliveryDate(schedule.deliveryDay, previous.chargeOffset, {
+    from: orderDate,
+  });
+  if (!next.ok) return next;
+
+  const packGap = previous.packGap == null ? null : previous.packGap;
+  const productionGap = previous.productionGap == null ? null : previous.productionGap;
+
+  return {
+    ok: true,
+    data: {
+      charge_date: next.charge_date,
+      matched_by: `${schedule.deliveryDay} by weekday arithmetic (HDS had no option)`,
+      delivery_date: next.delivery_date,
+      pack_date: packGap == null ? null : subtractDays(next.delivery_date, packGap),
+      production_date: productionGap == null ? null : subtractDays(next.delivery_date, productionGap),
+      region: getNoteAttribute(order, 'HDS Region'),
+      suburb: getNoteAttribute(order, 'HDS Suburb') || order?.shipping_address?.city || null,
+      postcode: getNoteAttribute(order, 'HDS Postcode') || order?.shipping_address?.zip || null,
+      schedule_id: schedule.scheduleId,
+      delivery_day: next.delivery_day,
+      delivery_window: getNoteAttribute(order, 'HDS Delivery Window'),
+      formatted_date: formatLongDate(next.delivery_date),
+      // No HDS option, so cutoff_info is unavailable; cutoffFor() falls back to
+      // the offset-derived charge date below.
+      option: {},
+      cutoff_override: {
+        cutoff_date: next.charge_date,
+        cutoff_day: next.charge_day,
+        charge_offset_days: previous.chargeOffset,
+      },
+    },
+  };
+}
+
 // Recompute a renewal's dates from the ORDER's own date and write them back.
 //
 // This is the whole Arigato replacement: resolve against HDS using the order date
@@ -249,14 +347,26 @@ async function rewriteRenewalOrder(order, { dryRun = false } = {}) {
   if (!orderDate) return { ok: false, reason: 'order has no created_at to resolve against' };
 
   const schedule = scheduleFor(order);
-  const result = await resolveRenewalDelivery({
+  let result = await resolveRenewalDelivery({
     postcode,
     suburb,
     chargeDateIso: order.created_at,
     scheduleId: schedule.scheduleId,
     deliveryDay: schedule.deliveryDay,
   });
-  if (!result.ok) return { ok: false, reason: result.reason, schedule };
+
+  // HDS is authoritative. Weekday arithmetic only stands in when HDS has no
+  // option for this weekday at all, and only when explicitly enabled, because it
+  // cannot see production cutoffs.
+  let usedFallback = false;
+  if (!result.ok) {
+    const fallback = fallbackFromWeekdayMath(order, schedule);
+    if (!fallback.ok) {
+      return { ok: false, reason: `${result.reason}; fallback: ${fallback.reason}`, schedule };
+    }
+    result = fallback;
+    usedFallback = true;
+  }
 
   const resolved = result.data;
   const attributes = buildOrderAttributes(resolved, {
@@ -264,7 +374,7 @@ async function rewriteRenewalOrder(order, { dryRun = false } = {}) {
   });
   const tag = packDateTag(resolved.pack_date);
 
-  if (dryRun) return { ok: true, dryRun: true, resolved, attributes, tag, orderDate, schedule };
+  if (dryRun) return { ok: true, dryRun: true, resolved, attributes, tag, orderDate, schedule, usedFallback };
 
   await updateOrderAttributes(orderId, {
     attributes,
@@ -273,11 +383,13 @@ async function rewriteRenewalOrder(order, { dryRun = false } = {}) {
     order,
   });
 
-  return { ok: true, resolved, attributes, tag, orderDate, schedule };
+  return { ok: true, resolved, attributes, tag, orderDate, schedule, usedFallback };
 }
 
 module.exports = {
   needsRewrite,
+  previousTuple,
+  fallbackFromWeekdayMath,
   scheduleFor,
   weekdayOf,
   timeRangeForWindow,
