@@ -97,6 +97,61 @@ function missingConfig(cfg) {
   ].filter(Boolean);
 }
 
+// Shopify's `host` param is base64 of "admin.shopify.com/store/<handle>", so the
+// shop can be recovered from it when `shop` itself is absent.
+function shopFromHost(host) {
+  if (!host) return null;
+  let decoded;
+  try {
+    decoded = Buffer.from(String(host), 'base64').toString('utf8');
+  } catch {
+    return null;
+  }
+  const handle = (decoded.match(/\/store\/([a-zA-Z0-9][a-zA-Z0-9-]*)/) || [])[1];
+  return handle ? `${handle}.myshopify.com` : null;
+}
+
+// The App URL.
+//
+// After a managed install, Shopify loads the App URL with hmac + host and NO code
+// — it expects an embedded app to exchange a session token there. This service has
+// no UI to do that, so we send the request into the authorization-code flow
+// instead, which is what actually yields the offline token we need.
+//
+// Landing here with no shop at all is a human opening the base URL, so answer with
+// something more useful than a 404.
+router.get('/', (req, res) => {
+  const cfg = config();
+  const shop = req.query.shop || shopFromHost(req.query.host);
+
+  if (shop && isValidShopDomain(shop)) {
+    // Signed request from Shopify: verify before redirecting anywhere, so this
+    // cannot be used as an open redirect.
+    if (req.query.hmac && !verifyOAuthHmac(req.query, cfg.clientSecret)) {
+      console.warn('[oauth] app-url request rejected: HMAC verification failed');
+      return res.status(401).send('invalid hmac');
+    }
+    if (cfg.allowedShop && shop !== cfg.allowedShop) {
+      return res.status(403).send(`This app only installs on ${cfg.allowedShop}`);
+    }
+    console.log(`[oauth] app url hit for ${shop} — starting the authorization-code flow`);
+    return res.redirect(`/auth?shop=${encodeURIComponent(shop)}`);
+  }
+
+  return res.type('text/plain').send(
+    [
+      'hds-order-enrichment',
+      '',
+      'This service has no UI. Endpoints:',
+      '  GET  /health',
+      '  GET  /auth?shop=<store>.myshopify.com   install and capture the Admin API token',
+      '  POST /webhooks/shopify/orders/create',
+      '  POST /webhooks/loop/order-upcoming',
+      '',
+    ].join('\n')
+  );
+});
+
 // Start the install.
 router.get('/auth', (req, res) => {
   const cfg = config();
@@ -203,3 +258,4 @@ module.exports.isValidShopDomain = isValidShopDomain;
 module.exports.signState = signState;
 module.exports.verifyState = verifyState;
 module.exports.verifyOAuthHmac = verifyOAuthHmac;
+module.exports.shopFromHost = shopFromHost;
