@@ -44,11 +44,38 @@ async function storedToken(shop) {
   return cache;
 }
 
+// Is this plausibly an Admin API access token at all?
+//
+// Access tokens are shpat_ (custom app), shpca_ (OAuth) or shppa_ (legacy private
+// app). An shpss_ value is the app's signing secret and a bare 32-char hex string
+// is an API key — neither will ever authenticate, and the Admin API answers both
+// with an indistinguishable 401.
+function looksLikeAccessToken(token) {
+  return /^shp(at|ca|pa)_/.test(String(token || ''));
+}
+
+let shadowWarned = false;
+
 // Resolve the token for a shop, reporting WHERE it came from — a 401 is much
 // easier to place when you know which of the two sources supplied the value.
 async function resolveAdminToken(shop) {
   const fromEnv = envToken();
-  if (fromEnv) return { token: fromEnv, source: 'SHOPIFY_ADMIN_TOKEN' };
+
+  if (fromEnv && looksLikeAccessToken(fromEnv)) {
+    return { token: fromEnv, source: 'SHOPIFY_ADMIN_TOKEN' };
+  }
+
+  // Env normally wins, but not when it holds the wrong KIND of secret. Letting it
+  // through would shadow a perfectly good OAuth token with a value that cannot
+  // work, and the resulting 401 looks identical to a genuine auth failure.
+  if (fromEnv && !shadowWarned) {
+    console.warn(
+      '[shopify] ignoring SHOPIFY_ADMIN_TOKEN: it is not an Admin API access token ' +
+        '(expected shpat_/shpca_). Falling back to the stored OAuth token — clear the ' +
+        'variable in Railway to silence this.'
+    );
+    shadowWarned = true;
+  }
 
   try {
     const stored = await storedToken(shop);
@@ -60,9 +87,12 @@ async function resolveAdminToken(shop) {
   return {
     token: null,
     source: 'none',
-    error:
-      'no Admin API token: SHOPIFY_ADMIN_TOKEN is not set and no OAuth install is ' +
-      `stored for ${shop}. Visit /auth?shop=${shop} to install the app.`,
+    error: fromEnv
+      ? 'SHOPIFY_ADMIN_TOKEN holds the wrong kind of secret (expected shpat_/shpca_), ' +
+        `and no OAuth install is stored for ${shop}. Visit /auth?shop=${shop} to install ` +
+        'the app, then clear that variable.'
+      : 'no Admin API token: SHOPIFY_ADMIN_TOKEN is not set and no OAuth install is ' +
+        `stored for ${shop}. Visit /auth?shop=${shop} to install the app.`,
   };
 }
 
