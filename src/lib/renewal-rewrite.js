@@ -178,11 +178,22 @@ const PACK_TAG_PREFIX = 'Pick-Pack-Date-';
 // NOT from Delivery-Location-Id: on a real renewal that field held
 // "NSW Sydney Metro" (a region name) rather than a postcode, so trusting it would
 // send garbage to the API. The labelled HDS keys, then the shipping address.
+// Delivery-Location-Id is only trustworthy when it actually looks like a
+// postcode. Real renewals carry both spellings: "2170" on one, "NSW Sydney Metro"
+// on another. Checking the shape lets the useful case through and keeps the region
+// name out of the API query.
+function isPostcodeShaped(value) {
+  return /^\d{4}$/.test(String(value == null ? '' : value).trim());
+}
+
 function locationFor(order) {
+  const locationId = getNoteAttribute(order, 'Delivery-Location-Id');
+
   const postcode =
     getNoteAttribute(order, 'HDS Postcode') ||
     getNoteAttribute(order, 'hds_postcode') ||
     order?.shipping_address?.zip ||
+    (isPostcodeShaped(locationId) ? String(locationId).trim() : null) ||
     null;
 
   const suburb =
@@ -388,6 +399,7 @@ async function rewriteRenewalOrder(order, { dryRun = false } = {}) {
 
 module.exports = {
   needsRewrite,
+  isPostcodeShaped,
   previousTuple,
   fallbackFromWeekdayMath,
   scheduleFor,
