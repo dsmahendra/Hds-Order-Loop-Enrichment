@@ -41,7 +41,8 @@ const LABEL_TO_KEY = {
   'HDS Delivery Day': 'hds_delivery_day',
   'HDS Delivery Window': 'hds_delivery_window',
   'HDS Schedule ID': 'hds_schedule_id',
-  'HDS Pack Date': 'hds_pack_date',
+  'HDS Ship Date': 'hds_pack_date',
+  'HDS Pack Date': 'hds_pack_date', // superseded by HDS Ship Date; still read on older orders
   'HDS Production Date': 'hds_production_date',
   'HDS Region': 'hds_region',
   'HDS Suburb': 'hds_suburb',
@@ -144,8 +145,11 @@ function getOrder(orderId) {
 // The Admin API REPLACES note_attributes wholesale, so sending only our keys
 // would delete Delivery-Time, Custom-Attribute-*, _amp_sc and everything else the
 // order carries. Existing entries keep their position; new keys are appended.
-function mergeNoteAttributes(existing, updates) {
-  const out = (Array.isArray(existing) ? existing : []).map((a) => ({ name: a?.name, value: a?.value }));
+function mergeNoteAttributes(existing, updates, removeNames = []) {
+  const drop = new Set(removeNames);
+  const out = (Array.isArray(existing) ? existing : [])
+    .filter((a) => !drop.has(a?.name))
+    .map((a) => ({ name: a?.name, value: a?.value }));
   for (const [name, value] of Object.entries(updates || {})) {
     if (value === null || value === undefined || value === '') continue;
     const hit = out.find((a) => a.name === name);
@@ -175,13 +179,19 @@ function mergeTags(existing, addTags = [], removePrefixes = []) {
 //
 // Pass `order` — e.g. the webhook payload — to merge without re-fetching;
 // otherwise the current order is read first.
-async function updateOrderAttributes(orderId, { attributes = {}, addTags = [], removeTagPrefixes = [], order = null } = {}) {
+async function updateOrderAttributes(
+  orderId,
+  { attributes = {}, addTags = [], removeTagPrefixes = [], removeAttributes = [], order = null } = {}
+) {
   const existing = order || (await getOrder(orderId))?.order;
 
   const payload = {
     order: {
       id: Number(orderId),
-      note_attributes: mergeNoteAttributes(existing?.note_attributes, attributes),
+      // removeAttributes drops keys we have renamed: leaving the old one behind
+      // would sit a stale value next to the new one, and downstream cannot tell
+      // which is authoritative.
+      note_attributes: mergeNoteAttributes(existing?.note_attributes, attributes, removeAttributes),
     },
   };
 

@@ -10,6 +10,8 @@ const {
   locationFor,
   timeRangeForWindow,
   isPostcodeShaped,
+  previousTuple,
+  SUPERSEDED_ATTRIBUTES,
 } = require('../src/lib/renewal-rewrite');
 const { mergeNoteAttributes, mergeTags } = require('../src/shopify');
 
@@ -196,6 +198,66 @@ test('invalid DELIVERY_WINDOW_TIMES fails safe instead of throwing', () => {
   withWindowTimes('{not json', () => {
     assert.ok(!('Delivery-Time' in buildOrderAttributes(RESOLVED)));
   });
+});
+
+// --- the HDS Ship Date rename ------------------------------------------------
+
+test('buildOrderAttributes writes HDS Ship Date, not HDS Pack Date', () => {
+  const a = buildOrderAttributes(RESOLVED);
+
+  assert.strictEqual(a['HDS Ship Date'], '2026/08/23');
+  assert.ok(!('HDS Pack Date' in a), 'the superseded label must not be written');
+  // Pick-Pack-Date is a separate downstream key and keeps its name.
+  assert.strictEqual(a['Pick-Pack-Date'], '2026/08/23');
+});
+
+test('the superseded label is listed for removal on rewrite', () => {
+  assert.ok(SUPERSEDED_ATTRIBUTES.includes('HDS Pack Date'));
+});
+
+test('a renamed key is dropped rather than left holding a stale value', () => {
+  const merged = mergeNoteAttributes(
+    [
+      { name: 'HDS Pack Date', value: '2026/08/09' },
+      { name: 'Delivery-Time', value: '12:00 AM - 7:00 AM' },
+    ],
+    { 'HDS Ship Date': '2026/08/23' },
+    SUPERSEDED_ATTRIBUTES
+  );
+
+  assert.deepStrictEqual(merged, [
+    { name: 'Delivery-Time', value: '12:00 AM - 7:00 AM' },
+    { name: 'HDS Ship Date', value: '2026/08/23' },
+  ]);
+});
+
+test('previousTuple reads either label, so older orders still work', () => {
+  const renamed = previousTuple(
+    attrs({ 'Delivery-Date': '2026/08/10', 'HDS Ship Date': '2026/08/09' })
+  );
+  const legacy = previousTuple(
+    attrs({ 'Delivery-Date': '2026/08/10', 'HDS Pack Date': '2026/08/09' })
+  );
+
+  assert.strictEqual(renamed.packGap, 1);
+  assert.strictEqual(legacy.packGap, 1);
+});
+
+// --- renewal cutoff ----------------------------------------------------------
+// For a renewal the cutoff IS the order date: Loop charges at the cutoff, so the
+// order existing means the cycle closed. Charge Offset stays the schedule's rule.
+
+test('a cutoff override wins over the schedule-derived cutoff', () => {
+  const a = buildOrderAttributes({
+    ...RESOLVED,
+    cutoff_override: { cutoff_date: '2026-08-19', cutoff_day: 'Wednesday', charge_offset_days: 3 },
+  });
+
+  assert.strictEqual(a['HDS Cutoff Date'], '2026/08/19');
+  assert.strictEqual(a['HDS Cutoff Day'], 'Wednesday');
+  // Still the schedule's offset, not delivery-minus-order-date (which would be 5)
+  // — that value is pushed to Loop to correct future charges.
+  assert.strictEqual(a['Charge Offset'], '3 Days');
 });
 
 test('packDateTag matches the tag format already on the orders', () => {
