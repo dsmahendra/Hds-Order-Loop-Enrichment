@@ -107,10 +107,18 @@ router.post('/shopify/orders/create', async (req, res) => {
   // enrichFromAttributes() would accept it as authoritative, skip the HDS API and
   // write the wrong pack/production dates into order_enrichments. The queue must
   // never see it.
-  if (source === 'loop' && REWRITE_RENEWALS) {
+  // Triggered by STALENESS, not by whether we recognised the order as a Loop
+  // renewal. A delivery date earlier than the order date is impossible for a
+  // checkout order — nobody picks a delivery before they order — so the condition
+  // alone is proof enough. It also means this works when LOOP_SHOPIFY_APP_ID is
+  // unset and the order carries no tags to sniff, which is exactly the case on
+  // the renewals seen so far.
+  if (REWRITE_RENEWALS) {
     const state = needsRewrite(order);
     if (!state.stale) {
-      console.log(`[webhook] order ${orderId}: ${state.reason} — no date rewrite needed`);
+      if (source === 'loop') {
+        console.log(`[webhook] order ${orderId}: ${state.reason} — no date rewrite needed`);
+      }
     } else {
       console.log(`[webhook] order ${orderId}: ${state.reason} — recomputing from the order date`);
       try {
