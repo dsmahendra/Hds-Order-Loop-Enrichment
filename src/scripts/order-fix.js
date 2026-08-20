@@ -114,6 +114,13 @@ async function main() {
     return;
   }
 
+  // Print the config before doing anything: a missing variable is by far the most
+  // common reason this script cannot run, and it is cheaper to see than to infer.
+  console.log('SHOPIFY_STORE       :', process.env.SHOPIFY_STORE || 'MISSING');
+  console.log('SHOPIFY_ADMIN_TOKEN :', process.env.SHOPIFY_ADMIN_TOKEN ? 'set' : 'MISSING');
+  console.log('HDS_API_BASE        :', process.env.HDS_API_BASE || 'MISSING');
+  console.log('DATABASE_URL        :', process.env.DATABASE_URL ? 'set (queue row will be reset)' : 'not set (Shopify only)');
+
   let ok = 0;
   const failures = [];
   for (const orderId of opts.orders) {
