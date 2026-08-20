@@ -69,35 +69,105 @@ function getHdsAttributes(order) {
   return Object.keys(out).length > 0 ? out : null;
 }
 
-// Push enriched data onto the Shopify order as a metafield (non-destructive).
-// Guarded by SYNC_TO_SHOPIFY; requires SHOPIFY_ADMIN_TOKEN + SHOPIFY_STORE.
-async function writeEnrichmentMetafield(orderId, enriched) {
+// One place for Admin API calls: base URL, auth header, and error shape.
+function shopifyRequest(method, path, body) {
   const store = process.env.SHOPIFY_STORE;
   const token = process.env.SHOPIFY_ADMIN_TOKEN;
   const version = process.env.SHOPIFY_API_VERSION || '2024-01';
   if (!store || !token) throw new Error('SHOPIFY_STORE / SHOPIFY_ADMIN_TOKEN not set');
 
-  const url = `https://${store}/admin/api/${version}/orders/${orderId}/metafields.json`;
-  const res = await fetch(url, {
-    method: 'POST',
+  return fetch(`https://${store}/admin/api/${version}${path}`, {
+    method,
     headers: {
       'X-Shopify-Access-Token': token,
       'Content-Type': 'application/json',
+      Accept: 'application/json',
     },
-    body: JSON.stringify({
-      metafield: {
-        namespace: 'hds',
-        key: 'enrichment',
-        type: 'json',
-        value: JSON.stringify(enriched),
-      },
-    }),
-  });
-
-  if (!res.ok) {
+    body: body === undefined ? undefined : JSON.stringify(body),
+  }).then(async (res) => {
     const text = await res.text().catch(() => '');
-    throw new Error(`Shopify metafield write failed ${res.status}: ${text.slice(0, 200)}`);
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      // Non-JSON body — the raw text carries the reason.
+    }
+    if (!res.ok) {
+      const reason = data?.errors ? JSON.stringify(data.errors) : text.slice(0, 200);
+      throw new Error(`Shopify ${method} ${path} failed ${res.status}: ${reason}`);
+    }
+    return data;
+  });
+}
+
+function getOrder(orderId) {
+  return shopifyRequest('GET', `/orders/${orderId}.json`);
+}
+
+// Merge updates into an order's existing note_attributes.
+//
+// The Admin API REPLACES note_attributes wholesale, so sending only our keys
+// would delete Delivery-Time, Custom-Attribute-*, _amp_sc and everything else the
+// order carries. Existing entries keep their position; new keys are appended.
+function mergeNoteAttributes(existing, updates) {
+  const out = (Array.isArray(existing) ? existing : []).map((a) => ({ name: a?.name, value: a?.value }));
+  for (const [name, value] of Object.entries(updates || {})) {
+    if (value === null || value === undefined || value === '') continue;
+    const hit = out.find((a) => a.name === name);
+    if (hit) hit.value = String(value);
+    else out.push({ name, value: String(value) });
   }
+  return out;
+}
+
+// Same replace-semantics problem for tags. removePrefixes drops superseded tags
+// (a stale Pick-Pack-Date-* from the previous cycle) so they don't accumulate.
+function mergeTags(existing, addTags = [], removePrefixes = []) {
+  const current = String(existing || '')
+    .split(',')
+    .map((t) => t.trim())
+    .filter(Boolean)
+    .filter((t) => !removePrefixes.some((prefix) => t.startsWith(prefix)));
+
+  for (const tag of addTags) {
+    if (!tag) continue;
+    if (!current.some((t) => t.toLowerCase() === String(tag).toLowerCase())) current.push(String(tag));
+  }
+  return current.join(', ');
+}
+
+// Write note attributes (and optionally tags) back onto an order.
+//
+// Pass `order` — e.g. the webhook payload — to merge without re-fetching;
+// otherwise the current order is read first.
+async function updateOrderAttributes(orderId, { attributes = {}, addTags = [], removeTagPrefixes = [], order = null } = {}) {
+  const existing = order || (await getOrder(orderId))?.order;
+
+  const payload = {
+    order: {
+      id: Number(orderId),
+      note_attributes: mergeNoteAttributes(existing?.note_attributes, attributes),
+    },
+  };
+
+  if (addTags.length || removeTagPrefixes.length) {
+    payload.order.tags = mergeTags(existing?.tags, addTags, removeTagPrefixes);
+  }
+
+  return shopifyRequest('PUT', `/orders/${orderId}.json`, payload);
+}
+
+// Push enriched data onto the Shopify order as a metafield (non-destructive).
+// Guarded by SYNC_TO_SHOPIFY; requires SHOPIFY_ADMIN_TOKEN + SHOPIFY_STORE.
+function writeEnrichmentMetafield(orderId, enriched) {
+  return shopifyRequest('POST', `/orders/${orderId}/metafields.json`, {
+    metafield: {
+      namespace: 'hds',
+      key: 'enrichment',
+      type: 'json',
+      value: JSON.stringify(enriched),
+    },
+  });
 }
 
 module.exports = {
@@ -107,4 +177,9 @@ module.exports = {
   getHdsAttributes,
   normalizeDate,
   writeEnrichmentMetafield,
+  shopifyRequest,
+  getOrder,
+  updateOrderAttributes,
+  mergeNoteAttributes,
+  mergeTags,
 };

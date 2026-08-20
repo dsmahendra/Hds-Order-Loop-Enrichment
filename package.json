@@ -11,6 +11,7 @@
     "loop:check": "node src/scripts/loop-check.js",
     "loop:update": "node src/scripts/loop-update.js",
     "orders:recent": "node src/scripts/orders-recent.js",
+    "order:fix": "node src/scripts/order-fix.js",
     "test": "node --test \"test/*.test.js\""
   },
   "engines": {

@@ -117,18 +117,23 @@ async function resolveRenewalDelivery({ postcode, suburb, chargeDateEpoch, charg
 // preferredWindow: the customer's saved window. The API returns every window the
 // schedule offers ("AM,Business Hours"), but an order carries the single chosen
 // one — so keep theirs if we have it, else fall back to the first offered.
-function buildHdsAttributes(resolved, preferredWindow = null) {
+function chooseDeliveryWindow(resolved, preferredWindow = null) {
   const offered = String(resolved.delivery_window || '')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
 
-  const window =
+  return (
     (preferredWindow && offered.includes(preferredWindow) ? preferredWindow : null) ||
     preferredWindow ||
     process.env.LOOP_DEFAULT_DELIVERY_WINDOW ||
     offered[0] ||
-    null;
+    null
+  );
+}
+
+function buildHdsAttributes(resolved, preferredWindow = null) {
+  const window = chooseDeliveryWindow(resolved, preferredWindow);
 
   return {
     hds_delivery_date: resolved.delivery_date,
@@ -144,4 +149,10 @@ function buildHdsAttributes(resolved, preferredWindow = null) {
   };
 }
 
-module.exports = { resolveRenewalDelivery, buildHdsAttributes, toChargeDate, addDays };
+module.exports = {
+  resolveRenewalDelivery,
+  buildHdsAttributes,
+  chooseDeliveryWindow,
+  toChargeDate,
+  addDays,
+};
