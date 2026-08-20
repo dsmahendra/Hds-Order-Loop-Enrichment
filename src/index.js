@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const webhooks = require('./routes/webhooks');
 const loopWebhooks = require('./routes/loop-webhooks');
+const shopifyOauth = require('./shopify-oauth');
 const { initQueueProcessor } = require('./jobs/enrich-orders-queue');
 
 const app = express();
@@ -13,6 +14,10 @@ app.use('/webhooks', express.raw({ type: 'application/json' }), loopWebhooks);
 
 // JSON parser for everything else (health, future admin endpoints).
 app.use(express.json());
+
+// Shopify OAuth install flow. Needed because Dev Dashboard apps issue their
+// Admin API token at install rather than exposing one to copy.
+app.use('/', shopifyOauth);
 
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'hds-order-enrichment' }));
 
