@@ -69,6 +69,27 @@ function getHdsAttributes(order) {
   return Object.keys(out).length > 0 ? out : null;
 }
 
+// Which Shopify secret is actually in SHOPIFY_ADMIN_TOKEN?
+//
+// The Admin API needs an ACCESS TOKEN (shpat_ for a custom app, shpca_ for an
+// OAuth app). Three other secrets sit next to it in the admin and get pasted here
+// by mistake: shpss_ is the webhook signing secret, and the API key / API secret
+// key are bare 32-char hex strings. Printing the prefix and length identifies the
+// mistake without revealing the value.
+function describeAdminToken(token) {
+  if (!token) return 'MISSING';
+  const t = String(token);
+  const shape = `${t.length} chars`;
+
+  if (t !== t.trim()) return `set but has surrounding whitespace (${shape}) — trim it`;
+  if (/^shpat_/.test(t)) return `set (shpat_… custom-app access token, ${shape})`;
+  if (/^shpca_/.test(t)) return `set (shpca_… OAuth access token, ${shape})`;
+  if (/^shpss_/.test(t)) return `set (shpss_… — that is the WEBHOOK SIGNING SECRET, not an access token)`;
+  if (/^shppa_/.test(t)) return `set (shppa_… legacy private-app password, ${shape})`;
+  if (/^[0-9a-f]{32}$/i.test(t)) return 'set (32-char hex — that is an API key or API SECRET key, not an access token)';
+  return `set (unrecognised format, ${shape})`;
+}
+
 // One place for Admin API calls: base URL, auth header, and error shape.
 function shopifyRequest(method, path, body) {
   const store = process.env.SHOPIFY_STORE;
@@ -100,7 +121,17 @@ function shopifyRequest(method, path, body) {
     }
     if (!res.ok) {
       const reason = data?.errors ? JSON.stringify(data.errors) : text.slice(0, 200);
-      throw new Error(`Shopify ${method} ${path} failed ${res.status}: ${reason}`);
+      let hint = '';
+      if (res.status === 401) {
+        // 401 is authentication: the token is not recognised at all. Worth
+        // distinguishing from 403, which means it authenticated but lacks a scope.
+        hint =
+          `\n  -> 401 is authentication, not scopes. SHOPIFY_ADMIN_TOKEN is ${describeAdminToken(token)}` +
+          `\n  -> check it is an Admin API access token for ${store}, and that the app is still installed`;
+      } else if (res.status === 403) {
+        hint = '\n  -> 403 is scopes: the token authenticated but lacks write_orders';
+      }
+      throw new Error(`Shopify ${method} ${path} failed ${res.status}: ${reason}${hint}`);
     }
     return data;
   });
@@ -178,6 +209,7 @@ function writeEnrichmentMetafield(orderId, enriched) {
 
 module.exports = {
   verifyWebhook,
+  describeAdminToken,
   webhookDigest,
   getNoteAttribute,
   getHdsAttributes,
