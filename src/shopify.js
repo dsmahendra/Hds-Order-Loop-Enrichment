@@ -93,7 +93,7 @@ function describeAdminToken(token) {
 }
 
 // One place for Admin API calls: base URL, auth header, and error shape.
-async function shopifyRequest(method, path, body) {
+async function shopifyRequestWithHeaders(method, path, body) {
   const store = process.env.SHOPIFY_STORE;
   const version = process.env.SHOPIFY_API_VERSION || '2024-01';
   if (!store) throw new Error('SHOPIFY_STORE not set — the Admin API cannot be reached.');
@@ -132,8 +132,44 @@ async function shopifyRequest(method, path, body) {
       }
       throw new Error(`Shopify ${method} ${path} failed ${res.status}: ${reason}${hint}`);
     }
-    return data;
+    // Headers matter for paging: the REST API returns its cursor in Link, not in
+    // the body. Callers that only want the body use shopifyRequest().
+    return { data, headers: res.headers };
   });
+}
+
+function shopifyRequest(method, path, body) {
+  return shopifyRequestWithHeaders(method, path, body).then((r) => r.data);
+}
+
+// Shopify pages with an opaque cursor in the Link header:
+//   Link: <https://…/orders.json?page_info=xyz&limit=250>; rel="next"
+function nextPageInfo(headers) {
+  const link = headers?.get?.('link') || '';
+  const next = link.split(',').find((part) => part.includes('rel="next"'));
+  if (!next) return null;
+  return (next.match(/[?&]page_info=([^&>]+)/) || [])[1] || null;
+}
+
+// One page of orders, newest first, plus the cursor for the next page.
+//
+// `status=any` is deliberate: the default only returns open orders, which would
+// silently skip everything already fulfilled or cancelled.
+async function listOrders({ limit = 250, pageInfo = null, createdAtMin = null, fields = null } = {}) {
+  const params = new URLSearchParams({ limit: String(limit) });
+
+  if (pageInfo) {
+    // Shopify rejects filter params alongside a cursor; the cursor already
+    // encodes them.
+    params.set('page_info', pageInfo);
+  } else {
+    params.set('status', 'any');
+    if (createdAtMin) params.set('created_at_min', createdAtMin);
+    if (fields) params.set('fields', fields);
+  }
+
+  const { data, headers } = await shopifyRequestWithHeaders('GET', `/orders.json?${params.toString()}`);
+  return { orders: data?.orders || [], pageInfo: nextPageInfo(headers) };
 }
 
 function getOrder(orderId) {
@@ -217,6 +253,8 @@ function writeEnrichmentMetafield(orderId, enriched) {
 
 module.exports = {
   verifyWebhook,
+  listOrders,
+  nextPageInfo,
   describeAdminToken,
   webhookDigest,
   getNoteAttribute,

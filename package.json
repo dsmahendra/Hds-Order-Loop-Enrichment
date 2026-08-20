@@ -13,6 +13,7 @@
     "orders:recent": "node src/scripts/orders-recent.js",
     "order:fix": "node src/scripts/order-fix.js",
     "shopify:check": "node src/scripts/shopify-check.js",
+    "labels:rename": "node src/scripts/labels-rename.js",
     "test": "node --test \"test/*.test.js\""
   },
   "engines": {

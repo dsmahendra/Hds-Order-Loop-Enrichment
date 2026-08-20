@@ -10,6 +10,8 @@ const {
 const { editChargeOffsetRetrying, subscriptionIdForOrderRetrying } = require('../loop');
 const { needsRewrite, rewriteRenewalOrder, cutoffFor } = require('../lib/renewal-rewrite');
 const { buildHdsAttributes } = require('../lib/renewal-date');
+const { legacyLabelUpdates, describeUpdates, isEnabled: renameEnabled } = require('../lib/legacy-labels');
+const { updateOrderAttributes } = require('../shopify');
 
 // Recompute stale renewal dates and write them back onto the order — the job
 // Arigato Automation was doing. Set REWRITE_RENEWAL_DATES=false to stand this
@@ -113,6 +115,7 @@ router.post('/shopify/orders/create', async (req, res) => {
   // alone is proof enough. It also means this works when LOOP_SHOPIFY_APP_ID is
   // unset and the order carries no tags to sniff, which is exactly the case on
   // the renewals seen so far.
+  let rewritten = false;
   if (REWRITE_RENEWALS) {
     const state = needsRewrite(order);
     if (!state.stale) {
@@ -141,6 +144,7 @@ router.post('/shopify/orders/create', async (req, res) => {
           // value: it's region-specific (3 days in NSW, 4 in VIC).
           const derivedOffset = cutoffFor(r.option).charge_offset_days;
           if (derivedOffset != null) chargeOffset = derivedOffset;
+          rewritten = true;
 
           console.log(
             `[webhook] order ${orderId}: dates rewritten — delivery ${r.delivery_date}, ` +
@@ -151,6 +155,26 @@ router.post('/shopify/orders/create', async (req, res) => {
         }
       } catch (err) {
         console.error(`[webhook] order ${orderId}: date rewrite failed — ${err.message}`);
+      }
+    }
+  }
+
+  // A rewritten order already carries the new labels: the rewrite replaces that
+  // whole set and strips the old keys. Everything else — first-time checkout orders
+  // above all — needs the rename on its own, with the VALUE untouched, since the
+  // date a customer chose at checkout is correct and only its label moved.
+  if (!rewritten && renameEnabled()) {
+    const updates = legacyLabelUpdates(order);
+    if (updates) {
+      try {
+        await updateOrderAttributes(orderId, {
+          attributes: updates.attributes,
+          removeAttributes: updates.remove,
+          order,
+        });
+        console.log(`[webhook] order ${orderId}: labels renamed — ${describeUpdates(updates)}`);
+      } catch (err) {
+        console.warn(`[webhook] order ${orderId}: label rename failed — ${err.message}`);
       }
     }
   }
