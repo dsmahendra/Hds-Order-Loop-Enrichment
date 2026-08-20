@@ -92,3 +92,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_loop_sub_charge
   ON loop_subscription_deliveries(subscription_id, charge_date);
 CREATE INDEX IF NOT EXISTS idx_loop_sub_status
   ON loop_subscription_deliveries(status);
+
+-- Shopify OAuth tokens.
+--
+-- Shopify retired legacy custom apps for this org, so there is no reveal-once
+-- Admin API token to paste into an env var: a Dev Dashboard app only exposes a
+-- Client ID and Secret, and its access token is issued through OAuth at install.
+-- We capture that token here. Offline access tokens do not expire, so this is
+-- written once per store and then just read.
+CREATE TABLE IF NOT EXISTS shopify_oauth_tokens (
+  shop         VARCHAR(255) PRIMARY KEY,   -- e.g. staging-workoutmeals.myshopify.com
+  access_token TEXT NOT NULL,
+  scope        TEXT,
+  installed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

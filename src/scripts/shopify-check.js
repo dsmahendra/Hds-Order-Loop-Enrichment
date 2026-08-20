@@ -14,10 +14,11 @@
 
 require('dotenv').config();
 const { describeAdminToken } = require('../shopify');
+const { resolveAdminToken } = require('../shopify-tokens');
 
 const store = process.env.SHOPIFY_STORE;
-const token = process.env.SHOPIFY_ADMIN_TOKEN;
 const version = process.env.SHOPIFY_API_VERSION || '2024-01';
+let token = null;
 
 async function probe(label, path) {
   const url = `https://${store}/admin/api/${version}${path}`;
@@ -41,11 +42,23 @@ async function probe(label, path) {
 async function main() {
   console.log('SHOPIFY_STORE       :', store || 'MISSING');
   console.log('SHOPIFY_API_VERSION :', version);
-  console.log('SHOPIFY_ADMIN_TOKEN :', describeAdminToken(token));
+
+  // The token can come from the env var or from an OAuth install; a 401 is much
+  // easier to place when the source is named.
+  const resolved = store ? await resolveAdminToken(store) : { token: null, source: 'none' };
+  token = resolved.token;
+  console.log('token source        :', resolved.source);
+  console.log('token               :', describeAdminToken(token));
+  if (resolved.scope) console.log('granted scopes      :', resolved.scope);
+  if (resolved.error) console.log('  ', resolved.error);
   console.log('SHOPIFY_WEBHOOK_SECRET:', process.env.SHOPIFY_WEBHOOK_SECRET ? 'set (unrelated to the Admin API)' : 'MISSING');
 
   if (!store || !token) {
-    console.log('\nCannot probe without both SHOPIFY_STORE and SHOPIFY_ADMIN_TOKEN.');
+    console.log('\nCannot probe without a store and a token.');
+    if (store && !token) {
+      const appUrl = process.env.APP_URL || '<APP_URL>';
+      console.log(`Install the app to obtain one:  ${appUrl}/auth?shop=${store}`);
+    }
     process.exitCode = 1;
     return;
   }
