@@ -8,6 +8,7 @@ const {
   cutoffFor,
   toSlashDate,
   locationFor,
+  timeRangeForWindow,
 } = require('../src/lib/renewal-rewrite');
 const { mergeNoteAttributes, mergeTags } = require('../src/shopify');
 
@@ -144,6 +145,56 @@ test('buildOrderAttributes omits keys it could not derive', () => {
   const a = buildOrderAttributes({ ...RESOLVED, production_date: null, option: {} });
   assert.ok(!('HDS Production Date' in a));
   assert.ok(!('Charge Offset' in a));
+});
+
+// --- Delivery-Time mapping ---------------------------------------------------
+// HDS knows window NAMES, not clock ranges, so the range is configuration.
+
+const withWindowTimes = (json, fn) => {
+  const saved = process.env.DELIVERY_WINDOW_TIMES;
+  if (json === undefined) delete process.env.DELIVERY_WINDOW_TIMES;
+  else process.env.DELIVERY_WINDOW_TIMES = json;
+  try {
+    return fn();
+  } finally {
+    if (saved === undefined) delete process.env.DELIVERY_WINDOW_TIMES;
+    else process.env.DELIVERY_WINDOW_TIMES = saved;
+  }
+};
+
+const WINDOW_TIMES = '{"AM":"12:00 AM - 7:00 AM","Business Hours":"8:00 AM - 6:00 PM"}';
+
+test('Delivery-Time is left untouched when no mapping is configured', () => {
+  withWindowTimes(undefined, () => {
+    assert.ok(!('Delivery-Time' in buildOrderAttributes(RESOLVED)));
+  });
+});
+
+test('Delivery-Time follows the chosen window when a mapping is configured', () => {
+  withWindowTimes(WINDOW_TIMES, () => {
+    assert.strictEqual(buildOrderAttributes(RESOLVED)['Delivery-Time'], '12:00 AM - 7:00 AM');
+    const other = buildOrderAttributes(RESOLVED, { preferredWindow: 'Business Hours' });
+    assert.strictEqual(other['Delivery-Time'], '8:00 AM - 6:00 PM');
+  });
+});
+
+test('timeRangeForWindow tolerates casing drift between schedule and config', () => {
+  withWindowTimes(WINDOW_TIMES, () => {
+    assert.strictEqual(timeRangeForWindow('am'), '12:00 AM - 7:00 AM');
+    assert.strictEqual(timeRangeForWindow('BUSINESS HOURS'), '8:00 AM - 6:00 PM');
+  });
+});
+
+test('an unmapped window leaves Delivery-Time alone rather than blanking it', () => {
+  withWindowTimes('{"Evening":"5:00 PM - 9:00 PM"}', () => {
+    assert.ok(!('Delivery-Time' in buildOrderAttributes(RESOLVED)));
+  });
+});
+
+test('invalid DELIVERY_WINDOW_TIMES fails safe instead of throwing', () => {
+  withWindowTimes('{not json', () => {
+    assert.ok(!('Delivery-Time' in buildOrderAttributes(RESOLVED)));
+  });
 });
 
 test('packDateTag matches the tag format already on the orders', () => {
