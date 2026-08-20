@@ -9,6 +9,7 @@ const {
   toSlashDate,
   locationFor,
   timeRangeForWindow,
+  isPostcodeShaped,
 } = require('../src/lib/renewal-rewrite');
 const { mergeNoteAttributes, mergeTags } = require('../src/shopify');
 
@@ -214,6 +215,32 @@ test('locationFor ignores Delivery-Location-Id, which held a region name', () =>
     ...attrs({ 'Delivery-Location-Id': 'NSW Sydney Metro' }),
   });
   assert.deepStrictEqual(loc, { postcode: '2176', suburb: 'Prairiewood' });
+});
+
+test('locationFor accepts Delivery-Location-Id when it is postcode-shaped', () => {
+  // A real renewal carried Delivery-Location-Id "2170" and no HDS Postcode.
+  const loc = locationFor({
+    shipping_address: { city: 'Liverpool' },
+    ...attrs({ 'Delivery-Location-Id': '2170', 'Delivery-Location': 'WOM' }),
+  });
+  assert.deepStrictEqual(loc, { postcode: '2170', suburb: 'Liverpool' });
+});
+
+test('the shipping address still wins over Delivery-Location-Id', () => {
+  const loc = locationFor({
+    shipping_address: { city: 'Prairiewood', zip: '2176' },
+    ...attrs({ 'Delivery-Location-Id': '2170' }),
+  });
+  assert.strictEqual(loc.postcode, '2176');
+});
+
+test('isPostcodeShaped admits only four-digit values', () => {
+  for (const good of ['2170', '2176', ' 3977 ']) {
+    assert.ok(isPostcodeShaped(good), `${good} should be accepted`);
+  }
+  for (const bad of ['NSW Sydney Metro', '290881', '217', 'WOM', '', null, undefined]) {
+    assert.ok(!isPostcodeShaped(bad), `${bad} should be rejected`);
+  }
 });
 
 test('locationFor prefers the labelled HDS keys over the shipping address', () => {
