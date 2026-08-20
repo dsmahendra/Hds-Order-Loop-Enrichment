@@ -8,6 +8,15 @@ const {
   normalizeDate,
 } = require('../shopify');
 const { editChargeOffsetRetrying, subscriptionIdForOrderRetrying } = require('../loop');
+const { needsRewrite, rewriteRenewalOrder, cutoffFor } = require('../lib/renewal-rewrite');
+const { buildHdsAttributes } = require('../lib/renewal-date');
+
+// Recompute stale renewal dates and write them back onto the order — the job
+// Arigato Automation was doing. Set REWRITE_RENEWAL_DATES=false to stand this
+// down without a deploy (e.g. while Arigato is still live, so the two don't both
+// write to the same order).
+const REWRITE_RENEWALS =
+  String(process.env.REWRITE_RENEWAL_DATES || 'true').toLowerCase() !== 'false';
 
 const router = express.Router();
 
@@ -83,14 +92,63 @@ router.post('/shopify/orders/create', async (req, res) => {
 
   // The checkout extension writes the HDS cutoff-days value as "Charge Offset"
   // (e.g. "3 Days"). We push this to Loop as the subscription's chargeOffset.
-  const chargeOffset = parseChargeOffset(order);
+  let chargeOffset = parseChargeOffset(order);
+
+  // What the rest of the handler works from. A Loop renewal's attributes are a
+  // verbatim copy of the subscription's — i.e. the FIRST cycle's dates — so these
+  // may be replaced below.
+  let effectiveDeliveryDate = deliveryDate;
+  let effectiveWindow = deliveryTime;
+  let effectiveSuburb = suburb;
+  let effectivePostcode = postcode;
+  let effectiveAttributes = getHdsAttributes(order);
+
+  // Done BEFORE the INSERT deliberately: the stale attribute set is COMPLETE, so
+  // enrichFromAttributes() would accept it as authoritative, skip the HDS API and
+  // write the wrong pack/production dates into order_enrichments. The queue must
+  // never see it.
+  if (source === 'loop' && REWRITE_RENEWALS) {
+    const state = needsRewrite(order);
+    if (!state.stale) {
+      console.log(`[webhook] order ${orderId}: ${state.reason} — no date rewrite needed`);
+    } else {
+      console.log(`[webhook] order ${orderId}: ${state.reason} — recomputing from the order date`);
+      try {
+        const out = await rewriteRenewalOrder(order);
+        if (!out.ok) {
+          console.warn(`[webhook] order ${orderId}: date rewrite skipped — ${out.reason}`);
+        } else {
+          const r = out.resolved;
+          const window = out.attributes['HDS Delivery Window'] || null;
+          effectiveDeliveryDate = r.delivery_date;
+          effectiveWindow = window || effectiveWindow;
+          effectiveSuburb = r.suburb || effectiveSuburb;
+          effectivePostcode = r.postcode || effectivePostcode;
+          effectiveAttributes = buildHdsAttributes(r, window);
+
+          // Push the offset for the REWRITTEN date, not the checkout's leftover
+          // value: it's region-specific (3 days in NSW, 4 in VIC).
+          const derivedOffset = cutoffFor(r.option).charge_offset_days;
+          if (derivedOffset != null) chargeOffset = derivedOffset;
+
+          console.log(
+            `[webhook] order ${orderId}: dates rewritten — delivery ${r.delivery_date}, ` +
+              `pack ${r.pack_date}, production ${r.production_date}` +
+              (out.tag ? `, tag ${out.tag}` : '')
+          );
+        }
+      } catch (err) {
+        console.error(`[webhook] order ${orderId}: date rewrite failed — ${err.message}`);
+      }
+    }
+  }
 
   // No Delivery-Date means nothing to enrich — a Loop renewal whose subscription
   // attributes weren't written in time, or a non-delivery order. Record it as
   // 'skipped' rather than dropping it silently, so the gap is visible and the
   // row can be requeued once a date is known.
-  const status = deliveryDate ? 'pending' : 'skipped';
-  const errorMessage = deliveryDate
+  const status = effectiveDeliveryDate ? 'pending' : 'skipped';
+  const errorMessage = effectiveDeliveryDate
     ? null
     : source === 'loop'
       ? 'Loop renewal arrived without Delivery-Date (subscription attribute not set before charge)'
@@ -108,14 +166,14 @@ router.post('/shopify/orders/create', async (req, res) => {
        ON CONFLICT (order_id) DO NOTHING`,
       [
         orderId,
-        deliveryDate,
-        postcode,
-        deliveryTime,
-        suburb,
+        effectiveDeliveryDate,
+        effectivePostcode,
+        effectiveWindow,
+        effectiveSuburb,
         status,
         errorMessage,
         source,
-        getHdsAttributes(order),
+        effectiveAttributes,
       ]
     );
 
@@ -133,7 +191,7 @@ router.post('/shopify/orders/create', async (req, res) => {
   // order looks subscription-related OR carries a charge offset to push.
   // loopSubscriptionId → Loop API calls; subscriptionId → our BIGINT column.
   let loopSubscriptionId = null;
-  if (deliveryDate || source === 'loop' || chargeOffset != null) {
+  if (effectiveDeliveryDate || source === 'loop' || chargeOffset != null) {
     try {
       loopSubscriptionId = await subscriptionIdForOrderRetrying(orderId, {
         onRetry: (attempt, wait, err) =>
@@ -198,13 +256,13 @@ router.post('/shopify/orders/create', async (req, res) => {
   }
 
   // A Loop renewal that DID carry a date closes the loop on our pre-charge write.
-  if (source === 'loop' && subscriptionId && deliveryDate) {
+  if (source === 'loop' && subscriptionId && effectiveDeliveryDate) {
     try {
       await pool.query(
         `UPDATE loop_subscription_deliveries
             SET shopify_order_id = $2, updated_at = NOW()
           WHERE subscription_id = $1 AND delivery_date = $3`,
-        [subscriptionId, orderId, deliveryDate]
+        [subscriptionId, orderId, effectiveDeliveryDate]
       );
     } catch (err) {
       console.warn(`[webhook] could not link order ${orderId} to subscription:`, err.message);
