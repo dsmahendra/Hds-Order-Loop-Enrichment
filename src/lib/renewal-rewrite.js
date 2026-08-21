@@ -221,17 +221,24 @@ function weekdayOf(isoDate) {
 // How to choose a renewal's delivery date when the customer's own weekday is not
 // the soonest option available.
 //
-//   keep-weekday (default) a Monday subscriber stays on Monday, even if that means
-//                          waiting a week because Monday's cutoff has passed
-//   earliest               take the soonest date HDS offers, whatever weekday it
-//                          falls on — the box arrives sooner, on a different day
+//   cutoff-day (default)   the day the order was created IS the cutoff day, so use
+//                          the region's schedule for that cutoff — which carries its
+//                          own ship and delivery days. Loop charges at the cutoff, so
+//                          the charge day identifies the schedule. Needs nothing from
+//                          the subscription's stored attributes, which is the point:
+//                          a stale Delivery-Date can no longer decide the weekday.
+//   keep-weekday           hold the weekday of the subscription's Delivery-Date, even
+//                          if that means waiting a week for its cutoff
+//   earliest               take the soonest date HDS offers, whatever weekday
 //
 // Real example, order placed 2026-08-21 in postcode 2170: a Sunday subscriber gets
 // Sun 30 Aug under keep-weekday (Sun 23 Aug's cutoff had gone) but Mon 24 Aug under
 // earliest. Six days apart, so this is a real business choice rather than a detail.
 function selectionMode() {
-  const raw = String(process.env.RENEWAL_DELIVERY_SELECTION || 'keep-weekday').toLowerCase();
-  return raw === 'earliest' ? 'earliest' : 'keep-weekday';
+  const raw = String(process.env.RENEWAL_DELIVERY_SELECTION || 'cutoff-day').toLowerCase();
+  if (raw === 'earliest') return 'earliest';
+  if (raw === 'keep-weekday') return 'keep-weekday';
+  return 'cutoff-day';
 }
 
 // Which schedule must the renewal stay on?
@@ -391,15 +398,19 @@ async function rewriteRenewalOrder(order, { dryRun = false, subscriptionAttribut
 
   // In 'earliest' mode the weekday constraint is simply not applied, so the
   // resolver returns the soonest option it has.
+  // In cutoff-day mode the order's own creation weekday selects the schedule, so
+  // no weekday is taken from the subscription at all.
+  const orderWeekday = weekdayOf(orderDate);
+
   let result = await resolveRenewalDelivery({
     postcode,
     suburb,
     chargeDateIso: order.created_at,
-    // Deliberately NOT passing scheduleId: it pins a weekday AND a window, so a
-    // stale id silently overrides the weekday resolved above. Filter on the
-    // weekday alone and let HDS's own cutoffs decide which date survives.
+    // Never scheduleId: it pins a weekday AND a window, so a stale id silently
+    // overrides whatever was resolved here.
     scheduleId: null,
-    deliveryDay: mode === 'earliest' ? null : schedule.deliveryDay,
+    cutoffDay: mode === 'cutoff-day' ? orderWeekday : null,
+    deliveryDay: mode === 'keep-weekday' ? schedule.deliveryDay : null,
   });
 
   // HDS is authoritative. Weekday arithmetic only stands in when HDS has no
@@ -429,8 +440,11 @@ async function rewriteRenewalOrder(order, { dryRun = false, subscriptionAttribut
   if (!usedFallback) {
     const scheduleCutoff = cutoffFor(resolved.option);
     resolved.cutoff_override = {
+      // The order date IS the cutoff for a renewal — Loop charges at the cutoff.
       cutoff_date: orderDate,
-      cutoff_day: weekdayOf(orderDate),
+      // The schedule's own cutoff weekday, which in cutoff-day mode is the order's
+      // weekday by construction; naming the schedule's keeps them honest if not.
+      cutoff_day: resolved.cutoff_day || weekdayOf(orderDate),
       charge_offset_days: scheduleCutoff.charge_offset_days,
     };
   }

@@ -63,6 +63,91 @@ const resolveWith = async (args) => {
   }
 };
 
+// --- cutoff-day selection ----------------------------------------------------
+// The day a renewal order is created IS its cutoff day, because Loop charges at
+// the cutoff. That identifies which of the region's schedules it belongs to, and
+// the schedule carries its own ship and delivery days. NSW, per HDS:
+//   Thu -> Sat -> Sun    Fri -> Sun -> Mon    Sun -> Tue -> Wed
+//   Mon -> Wed -> Thu    Tue -> Thu -> Fri    Wed -> Fri -> Sat
+const NSW_OPTIONS = [
+  { schedule_id: 10, delivery_day: 'Sunday',    delivery_date: '2026-08-30', pack_date: '2026-08-29', production_date: '2026-08-28', cutoff_info: 'Thursday 11 PM' },
+  { schedule_id: 1,  delivery_day: 'Monday',    delivery_date: '2026-08-31', pack_date: '2026-08-30', production_date: '2026-08-29', cutoff_info: 'Friday 11 PM' },
+  { schedule_id: 5,  delivery_day: 'Wednesday', delivery_date: '2026-09-02', pack_date: '2026-09-01', production_date: '2026-08-31', cutoff_info: 'Sunday 11 PM' },
+  { schedule_id: 7,  delivery_day: 'Thursday',  delivery_date: '2026-09-03', pack_date: '2026-09-02', production_date: '2026-09-01', cutoff_info: 'Monday 11 PM' },
+];
+
+const resolveByCutoff = async (cutoffDay) => {
+  const originalFetch = global.fetch;
+  global.fetch = stubOptions(NSW_OPTIONS);
+  try {
+    return await resolveRenewalDelivery({
+      postcode: '2170',
+      suburb: 'Prestons',
+      chargeDateIso: '2026-08-28T09:00:00+10:00',
+      cutoffDay,
+    });
+  } finally {
+    global.fetch = originalFetch;
+  }
+};
+
+test('a Friday cutoff selects the schedule that ships Sunday and delivers Monday', async () => {
+  const result = await resolveByCutoff('Friday');
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.delivery_date, '2026-08-31'); // Monday
+  assert.equal(result.data.pack_date, '2026-08-30'); // Sunday
+  assert.equal(result.data.matched_by, 'Friday cutoff schedule');
+  assert.equal(result.data.cutoff_day, 'Friday');
+});
+
+test('a Thursday cutoff selects Sunday delivery, shipping Saturday', async () => {
+  const result = await resolveByCutoff('Thursday');
+
+  assert.equal(result.data.delivery_date, '2026-08-30'); // Sunday
+  assert.equal(result.data.pack_date, '2026-08-29'); // Saturday
+});
+
+test('a Monday cutoff selects Thursday delivery, shipping Wednesday', async () => {
+  const result = await resolveByCutoff('Monday');
+
+  assert.equal(result.data.delivery_date, '2026-09-03'); // Thursday
+  assert.equal(result.data.pack_date, '2026-09-02'); // Wednesday
+});
+
+test('the cutoff day is matched case-insensitively', async () => {
+  const result = await resolveByCutoff('friday');
+  assert.equal(result.data.delivery_date, '2026-08-31');
+});
+
+test('a weekday with no cutoff in the region falls back rather than failing', async () => {
+  // NSW has no Saturday cutoff. An unprocessed order is worse than a later box.
+  const result = await resolveByCutoff('Saturday');
+
+  assert.equal(result.ok, true);
+  assert.match(result.data.matched_by, /no Saturday cutoff in this region/);
+  assert.equal(result.data.delivery_date, '2026-08-30'); // the soonest on offer
+});
+
+test('cutoff-day selection ignores the delivery weekday entirely', async () => {
+  // The stale subscription date said Sunday; a Friday charge must still yield
+  // Monday, which is the whole point of selecting on the cutoff.
+  const originalFetch = global.fetch;
+  global.fetch = stubOptions(NSW_OPTIONS);
+  try {
+    const result = await resolveRenewalDelivery({
+      postcode: '2170',
+      suburb: 'Prestons',
+      chargeDateIso: '2026-08-28T09:00:00+10:00',
+      cutoffDay: 'Friday',
+      deliveryDay: 'Sunday', // deliberately contradictory
+    });
+    assert.equal(result.data.delivery_date, '2026-08-31'); // Monday wins
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test('a Monday subscription gets the following Monday, not the sooner Friday', async () => {
   const result = await resolveWith({ deliveryDay: 'Monday' });
 
