@@ -24,6 +24,14 @@ const { updateOrderAttributes } = require('../shopify');
 const REWRITE_RENEWALS =
   String(process.env.REWRITE_RENEWAL_DATES || 'true').toLowerCase() !== 'false';
 
+// Some errors (a bad DATABASE_URL among them) arrive with an empty message, which
+// logs as "failed to queue order: " and says nothing. Fall back to whatever the
+// error does carry.
+function describeError(err) {
+  if (!err) return 'unknown error';
+  return err.message || err.code || err.name || String(err);
+}
+
 const router = express.Router();
 
 // Shopify "Order creation" webhook.
@@ -120,6 +128,7 @@ router.post('/shopify/orders/create', async (req, res) => {
   // unset and the order carries no tags to sniff, which is exactly the case on
   // the renewals seen so far.
   let rewritten = false;
+  let rewriteFailed = false;
   let loopSubscriptionIdEarly = null;
   // Recorded so a questioned date can be explained later: what the order arrived
   // with, and what the resolver locked onto.
@@ -147,12 +156,13 @@ router.post('/shopify/orders/create', async (req, res) => {
         if (context) loopSubscriptionIdEarly = context.subscriptionId;
       } catch (err) {
         console.warn(
-          `[webhook] order ${orderId}: could not read the subscription for its delivery day — ${err.message}`
+          `[webhook] order ${orderId}: could not read the subscription for its delivery day — ${describeError(err)}`
         );
       }
       try {
         const out = await rewriteRenewalOrder(order, { subscriptionAttributes });
         if (!out.ok) {
+          rewriteFailed = true;
           console.warn(
             `[webhook] order ${orderId}: date rewrite skipped — ${out.reason}` +
               (out.schedule ? ` (schedule from ${out.schedule.derivedFrom})` : '')
@@ -185,7 +195,8 @@ router.post('/shopify/orders/create', async (req, res) => {
           );
         }
       } catch (err) {
-        console.error(`[webhook] order ${orderId}: date rewrite failed — ${err.message}`);
+        rewriteFailed = true;
+        console.error(`[webhook] order ${orderId}: date rewrite failed — ${describeError(err)}`);
       }
     }
   }
@@ -205,7 +216,7 @@ router.post('/shopify/orders/create', async (req, res) => {
         });
         console.log(`[webhook] order ${orderId}: labels renamed — ${describeUpdates(updates)}`);
       } catch (err) {
-        console.warn(`[webhook] order ${orderId}: label rename failed — ${err.message}`);
+        console.warn(`[webhook] order ${orderId}: label rename failed — ${describeError(err)}`);
       }
     }
   }
@@ -214,12 +225,18 @@ router.post('/shopify/orders/create', async (req, res) => {
   // attributes weren't written in time, or a non-delivery order. Record it as
   // 'skipped' rather than dropping it silently, so the gap is visible and the
   // row can be requeued once a date is known.
-  const status = effectiveDeliveryDate ? 'pending' : 'skipped';
-  const errorMessage = effectiveDeliveryDate
-    ? null
-    : source === 'loop'
-      ? 'Loop renewal arrived without Delivery-Date (subscription attribute not set before charge)'
-      : 'order has no Delivery-Date';
+  // A failed rewrite must NOT be enriched from the stale attributes: that set is
+  // complete, so enrichFromAttributes would accept it as authoritative and write
+  // dates that already expired into order_enrichments. Hold it instead, visibly,
+  // for order:fix to redo once the cause is cleared.
+  const status = rewriteFailed || !effectiveDeliveryDate ? 'skipped' : 'pending';
+  const errorMessage = rewriteFailed
+    ? 'stale renewal dates could not be recomputed — held rather than enriched from expired attributes (retry with order:fix)'
+    : effectiveDeliveryDate
+      ? null
+      : source === 'loop'
+        ? 'Loop renewal arrived without Delivery-Date (subscription attribute not set before charge)'
+        : 'order has no Delivery-Date';
 
   // Queue the order BEFORE touching Loop. The subscription lookup below waits on
   // Loop's ingest lag (up to ~18s), and a restart inside that window must not
@@ -241,7 +258,8 @@ router.post('/shopify/orders/create', async (req, res) => {
         status,
         errorMessage,
         source,
-        effectiveAttributes,
+        // Same reason: withhold the expired set rather than let it look authoritative.
+        rewriteFailed ? null : effectiveAttributes,
         previousDeliveryDate,
         rewriteMatchedBy,
         rewriteScheduleSource,
@@ -254,7 +272,7 @@ router.post('/shopify/orders/create', async (req, res) => {
       console.log(`[webhook] order ${orderId} (${source}) has no Delivery-Date — recorded as skipped`);
     }
   } catch (err) {
-    console.error(`[webhook] failed to queue order ${orderId}:`, err.message);
+    console.error(`[webhook] failed to queue order ${orderId}:`, describeError(err));
   }
 
   // Resolve the subscription via Loop's order lookup (returns the
@@ -267,12 +285,14 @@ router.post('/shopify/orders/create', async (req, res) => {
       loopSubscriptionId = await subscriptionIdForOrderRetrying(orderId, {
         onRetry: (attempt, wait, err) =>
           console.warn(
-            `[webhook] order ${orderId}: Loop lookup attempt ${attempt} failed (${err.message}) — retrying in ${wait}ms`
+            `[webhook] order ${orderId}: Loop lookup attempt ${attempt} failed (${describeError(err)}) — retrying in ${wait}ms`
           ),
       });
     } catch (err) {
-      console.warn(`[webhook] Loop subscription lookup failed for order ${orderId}:`, err.message);
+      console.warn(`[webhook] Loop subscription lookup failed for order ${orderId}:`, describeError(err));
     }
+  } else if (loopSubscriptionId) {
+    console.log(`[webhook] order ${orderId}: subscription ${loopSubscriptionId} already resolved — no second lookup`);
   } else {
     console.log(
       `[webhook] order ${orderId}: no Delivery-Date, not a Loop order and no Charge Offset — skipping Loop lookup`
@@ -291,7 +311,7 @@ router.post('/shopify/orders/create', async (req, res) => {
         [orderId, subscriptionId]
       );
     } catch (err) {
-      console.warn(`[webhook] could not store subscription id for order ${orderId}:`, err.message);
+      console.warn(`[webhook] could not store subscription id for order ${orderId}:`, describeError(err));
     }
   }
 
@@ -303,7 +323,7 @@ router.post('/shopify/orders/create', async (req, res) => {
       const res = await editChargeOffsetRetrying(loopSubscriptionId, chargeOffset, {
         onRetry: (attempt, wait, err) =>
           console.warn(
-            `[webhook] order ${orderId}: chargeOffset attempt ${attempt} failed (${err.message}) — retrying in ${wait}ms`
+            `[webhook] order ${orderId}: chargeOffset attempt ${attempt} failed (${describeError(err)}) — retrying in ${wait}ms`
           ),
       });
       console.log(
@@ -313,7 +333,7 @@ router.post('/shopify/orders/create', async (req, res) => {
     } catch (err) {
       console.warn(
         `[webhook] failed to set Loop chargeOffset for ${loopSubscriptionId}:`,
-        err.message
+        describeError(err)
       );
     }
   } else if (chargeOffset == null) {
@@ -336,7 +356,7 @@ router.post('/shopify/orders/create', async (req, res) => {
         [subscriptionId, orderId, effectiveDeliveryDate]
       );
     } catch (err) {
-      console.warn(`[webhook] could not link order ${orderId} to subscription:`, err.message);
+      console.warn(`[webhook] could not link order ${orderId} to subscription:`, describeError(err));
     }
   }
 });
