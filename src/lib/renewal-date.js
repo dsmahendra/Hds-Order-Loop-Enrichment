@@ -8,6 +8,13 @@
 
 const LEAD_DAYS = Number(process.env.LOOP_DELIVERY_LEAD_DAYS || 0);
 
+const {
+  calculateNextDeliveryDate,
+  formatLongDate,
+  daysBetween,
+  subtractDays,
+} = require('./next-delivery');
+
 function base() {
   return (process.env.HDS_API_BASE || '').replace(/\/+$/, '');
 }
@@ -149,15 +156,53 @@ async function resolveRenewalDelivery({
     };
   }
 
+  // Cutoff-day mode uses the schedule, not the schedule's next available date.
+  //
+  // HDS only lists options whose cutoff is still ahead of NOW, so an order created
+  // on Friday 21 Aug can no longer be offered Monday 24 Aug once that Friday 23:00
+  // cutoff passes — yet 24 Aug is the date that order was entitled to, and the one
+  // a backfill has to produce. So we take the schedule (its delivery weekday and
+  // its pack/production gaps, both region-specific) and compute the dates from the
+  // ORDER date instead of reading the option's own.
+  //
+  // For a renewal processed on its charge day the two agree; they diverge only when
+  // the order is handled after its cutoff, which is exactly when the computed date
+  // is the correct one.
+  let dates = {
+    delivery_date: chosen.delivery_date,
+    pack_date: chosen.pack_date || null,
+    production_date: chosen.production_date || null,
+    formatted_date: chosen.formatted_date || null,
+  };
+
+  if (byCutoffDay.length) {
+    const packGap = daysBetween(chosen.delivery_date, chosen.pack_date);
+    const productionGap = daysBetween(chosen.delivery_date, chosen.production_date);
+    const next = calculateNextDeliveryDate(chosen.delivery_day, null, {
+      from: chargeDate,
+      inclusive: false, // a cutoff day is never its own delivery day
+    });
+
+    if (next.ok) {
+      dates = {
+        delivery_date: next.delivery_date,
+        pack_date: packGap == null ? null : subtractDays(next.delivery_date, packGap),
+        production_date: productionGap == null ? null : subtractDays(next.delivery_date, productionGap),
+        formatted_date: formatLongDate(next.delivery_date),
+      };
+      matchedBy = `${cutoffDay} cutoff schedule ${chosen.schedule_id} (${chosen.delivery_day} delivery, computed from the order date)`;
+    }
+  }
+
   return {
     ok: true,
     data: {
       charge_date: chargeDate,
       matched_by: matchedBy,
       cutoff_day: cutoffWeekdayOf(chosen),
-      delivery_date: chosen.delivery_date,
-      pack_date: chosen.pack_date || null,
-      production_date: chosen.production_date || null,
+      delivery_date: dates.delivery_date,
+      pack_date: dates.pack_date,
+      production_date: dates.production_date,
       region: result.data.region?.name || null,
       suburb: result.data.suburb?.name || suburb || null,
       postcode: result.data.suburb?.postcode || String(postcode),
@@ -165,7 +210,7 @@ async function resolveRenewalDelivery({
       schedule_id: chosen.schedule_id ?? null,
       delivery_day: chosen.delivery_day || null,
       delivery_window: chosen.delivery_window || null,
-      formatted_date: chosen.formatted_date || null,
+      formatted_date: dates.formatted_date,
       option: chosen,
     },
   };
