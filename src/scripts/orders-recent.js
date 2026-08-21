@@ -66,6 +66,11 @@ async function main() {
     console.log(`  postcode/suburb : ${r.delivery_location_id || '?'} / ${r.suburb || '?'}`);
     console.log(`  subscription_id : ${r.subscription_id || '(not resolved — Loop lookup failed)'}`);
     console.log(`  hds_* attrs     : ${Object.keys(attrs).length ? Object.keys(attrs).join(', ') : '(none — order had no HDS note attributes)'}`);
+    if (r.previous_delivery_date) {
+      console.log(`  arrived with    : Delivery-Date ${String(r.previous_delivery_date).slice(0, 10)} (rewritten)`);
+    }
+    if (r.rewrite_schedule_source) console.log(`  weekday from    : ${r.rewrite_schedule_source}`);
+    if (r.rewrite_matched_by) console.log(`  matched on      : ${r.rewrite_matched_by}`);
     if (r.error_message) console.log(`  error           : ${r.error_message}`);
   }
 

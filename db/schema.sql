@@ -107,3 +107,14 @@ CREATE TABLE IF NOT EXISTS shopify_oauth_tokens (
   installed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Why the rewrite chose the date it did.
+--
+-- The rewrite overwrites the stale attributes, so the input that drove the
+-- decision is gone by the time anyone asks why. These record it: the delivery date
+-- the order arrived with, and what the resolver matched on ("schedule 10",
+-- "Sunday", "earliest available"). Without them, diagnosing a wrong date means
+-- hunting through container logs that may already have rotated.
+ALTER TABLE orders_to_enrich ADD COLUMN IF NOT EXISTS previous_delivery_date DATE;
+ALTER TABLE orders_to_enrich ADD COLUMN IF NOT EXISTS rewrite_matched_by VARCHAR(120);
+ALTER TABLE orders_to_enrich ADD COLUMN IF NOT EXISTS rewrite_schedule_source VARCHAR(120);
