@@ -97,7 +97,7 @@ test('a Friday cutoff selects the schedule that ships Sunday and delivers Monday
   assert.equal(result.ok, true);
   assert.equal(result.data.delivery_date, '2026-08-31'); // Monday
   assert.equal(result.data.pack_date, '2026-08-30'); // Sunday
-  assert.equal(result.data.matched_by, 'Friday cutoff schedule');
+  assert.match(result.data.matched_by, /Friday cutoff schedule 1 \(Monday delivery, computed from the order date\)/);
   assert.equal(result.data.cutoff_day, 'Friday');
 });
 
