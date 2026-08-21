@@ -12,6 +12,7 @@ const {
   isPostcodeShaped,
   previousTuple,
   SUPERSEDED_ATTRIBUTES,
+  scheduleFor,
 } = require('../src/lib/renewal-rewrite');
 const { mergeNoteAttributes, mergeTags } = require('../src/shopify');
 
@@ -97,6 +98,44 @@ test('needsRewrite falls back to the labelled HDS key', () => {
 
 test('needsRewrite does not rewrite when there is no order date to compare', () => {
   assert.strictEqual(needsRewrite(attrs({ 'Delivery-Date': '2026/08/10' })).stale, false);
+});
+
+// --- where the delivery weekday comes from -----------------------------------
+// Loop has no deliveryDay field. Its only record of a weekday is the
+// subscription's own Delivery-Date attribute.
+
+test('the subscription Delivery-Date outranks anything on the order', () => {
+  const order = {
+    created_at: '2026-08-21T09:46:00+10:00',
+    ...attrs({ 'Delivery-Date': '2026/08/17', 'HDS Delivery Day': 'Monday' }),
+  };
+  const schedule = scheduleFor(order, { 'Delivery-Date': '2026-07-26' }); // a Sunday
+
+  assert.strictEqual(schedule.deliveryDay, 'Sunday');
+  assert.match(schedule.derivedFrom, /Loop subscription Delivery-Date 2026-07-26/);
+});
+
+test('without subscription attributes it falls back to the order', () => {
+  const order = { created_at: '2026-08-21T09:46:00+10:00', ...attrs({ 'HDS Delivery Day': 'Monday' }) };
+  const schedule = scheduleFor(order, null);
+
+  assert.strictEqual(schedule.deliveryDay, 'Monday');
+  assert.match(schedule.derivedFrom, /order HDS Delivery Day/);
+});
+
+test('and then to the weekday of the order own delivery date', () => {
+  const order = { created_at: '2026-08-21T09:46:00+10:00', ...attrs({ 'Delivery-Date': '2026/08/17' }) };
+  const schedule = scheduleFor(order, null);
+
+  assert.strictEqual(schedule.deliveryDay, 'Monday');
+  assert.match(schedule.derivedFrom, /order Delivery-Date 2026-08-17/);
+});
+
+test('a subscription with no Delivery-Date does not mask the order value', () => {
+  const order = { created_at: '2026-08-21T09:46:00+10:00', ...attrs({ 'HDS Delivery Day': 'Friday' }) };
+  const schedule = scheduleFor(order, { 'Delivery-Time': '12:00 AM - 7:00 AM' });
+
+  assert.strictEqual(schedule.deliveryDay, 'Friday');
 });
 
 // --- attribute construction --------------------------------------------------

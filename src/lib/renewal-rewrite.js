@@ -242,9 +242,16 @@ function selectionMode() {
 // neither label is present the weekday is derived from the PREVIOUS delivery
 // date, which every renewal carries by definition — that staleness is exactly
 // why these orders need rewriting in the first place.
-function scheduleFor(order) {
+function scheduleFor(order, subscriptionAttributes = null) {
   const scheduleId =
     getNoteAttribute(order, 'HDS Schedule ID') || getNoteAttribute(order, 'hds_schedule_id');
+
+  // The SUBSCRIPTION's own Delivery-Date first. We rewrite the order's attributes,
+  // so the order has stopped being an independent witness to what the customer
+  // chose; the subscription still is. Loop has no deliveryDay field — this
+  // attribute is its only record of a weekday.
+  const subDateRaw = subscriptionAttributes ? subscriptionAttributes['Delivery-Date'] : null;
+  const subDate = subDateRaw ? normalizeDate(subDateRaw) : null;
 
   const labelledDay =
     getNoteAttribute(order, 'HDS Delivery Day') || getNoteAttribute(order, 'hds_delivery_day');
@@ -255,16 +262,18 @@ function scheduleFor(order) {
     getNoteAttribute(order, 'hds_delivery_date');
   const previous = previousRaw ? normalizeDate(previousRaw) : null;
 
-  const deliveryDay = labelledDay || weekdayOf(previous);
+  const deliveryDay = weekdayOf(subDate) || labelledDay || weekdayOf(previous);
 
   return {
     scheduleId: scheduleId || null,
     deliveryDay: deliveryDay || null,
-    derivedFrom: labelledDay
-      ? 'HDS Delivery Day'
-      : previous
-        ? 'previous delivery ' + previous
-        : 'nothing',
+    derivedFrom: subDate
+      ? 'Loop subscription Delivery-Date ' + subDate
+      : labelledDay
+        ? 'order HDS Delivery Day'
+        : previous
+          ? 'order Delivery-Date ' + previous
+          : 'nothing',
   };
 }
 
@@ -365,7 +374,7 @@ function fallbackFromWeekdayMath(order, schedule) {
 // This is the whole Arigato replacement: resolve against HDS using the order date
 // as the reference (not the stale checkout value), then merge the result onto the
 // order's note attributes and refresh the pick-pack tag.
-async function rewriteRenewalOrder(order, { dryRun = false } = {}) {
+async function rewriteRenewalOrder(order, { dryRun = false, subscriptionAttributes = null } = {}) {
   const orderId = order?.id;
   if (!orderId) return { ok: false, reason: 'order payload has no id' };
 
@@ -377,7 +386,7 @@ async function rewriteRenewalOrder(order, { dryRun = false } = {}) {
   const orderDate = String(order.created_at || '').slice(0, 10);
   if (!orderDate) return { ok: false, reason: 'order has no created_at to resolve against' };
 
-  const schedule = scheduleFor(order);
+  const schedule = scheduleFor(order, subscriptionAttributes);
   const mode = selectionMode();
 
   // In 'earliest' mode the weekday constraint is simply not applied, so the
@@ -386,7 +395,10 @@ async function rewriteRenewalOrder(order, { dryRun = false } = {}) {
     postcode,
     suburb,
     chargeDateIso: order.created_at,
-    scheduleId: mode === 'earliest' ? null : schedule.scheduleId,
+    // Deliberately NOT passing scheduleId: it pins a weekday AND a window, so a
+    // stale id silently overrides the weekday resolved above. Filter on the
+    // weekday alone and let HDS's own cutoffs decide which date survives.
+    scheduleId: null,
     deliveryDay: mode === 'earliest' ? null : schedule.deliveryDay,
   });
 
