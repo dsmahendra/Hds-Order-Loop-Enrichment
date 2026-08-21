@@ -218,6 +218,22 @@ function weekdayOf(isoDate) {
   return name ? name.charAt(0).toUpperCase() + name.slice(1) : null;
 }
 
+// How to choose a renewal's delivery date when the customer's own weekday is not
+// the soonest option available.
+//
+//   keep-weekday (default) a Monday subscriber stays on Monday, even if that means
+//                          waiting a week because Monday's cutoff has passed
+//   earliest               take the soonest date HDS offers, whatever weekday it
+//                          falls on — the box arrives sooner, on a different day
+//
+// Real example, order placed 2026-08-21 in postcode 2170: a Sunday subscriber gets
+// Sun 30 Aug under keep-weekday (Sun 23 Aug's cutoff had gone) but Mon 24 Aug under
+// earliest. Six days apart, so this is a real business choice rather than a detail.
+function selectionMode() {
+  const raw = String(process.env.RENEWAL_DELIVERY_SELECTION || 'keep-weekday').toLowerCase();
+  return raw === 'earliest' ? 'earliest' : 'keep-weekday';
+}
+
 // Which schedule must the renewal stay on?
 //
 // A Monday delivery stays a Monday delivery, so the previous cycle's schedule is
@@ -362,12 +378,16 @@ async function rewriteRenewalOrder(order, { dryRun = false } = {}) {
   if (!orderDate) return { ok: false, reason: 'order has no created_at to resolve against' };
 
   const schedule = scheduleFor(order);
+  const mode = selectionMode();
+
+  // In 'earliest' mode the weekday constraint is simply not applied, so the
+  // resolver returns the soonest option it has.
   let result = await resolveRenewalDelivery({
     postcode,
     suburb,
     chargeDateIso: order.created_at,
-    scheduleId: schedule.scheduleId,
-    deliveryDay: schedule.deliveryDay,
+    scheduleId: mode === 'earliest' ? null : schedule.scheduleId,
+    deliveryDay: mode === 'earliest' ? null : schedule.deliveryDay,
   });
 
   // HDS is authoritative. Weekday arithmetic only stands in when HDS has no
@@ -423,6 +443,7 @@ async function rewriteRenewalOrder(order, { dryRun = false } = {}) {
 
 module.exports = {
   needsRewrite,
+  selectionMode,
   SUPERSEDED_ATTRIBUTES,
   isPostcodeShaped,
   previousTuple,
