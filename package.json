@@ -12,6 +12,7 @@
     "loop:update": "node src/scripts/loop-update.js",
     "orders:recent": "node src/scripts/orders-recent.js",
     "order:fix": "node src/scripts/order-fix.js",
+    "order:explain": "node src/scripts/order-explain.js",
     "shopify:check": "node src/scripts/shopify-check.js",
     "labels:rename": "node src/scripts/labels-rename.js",
     "test": "node --test \"test/*.test.js\""
