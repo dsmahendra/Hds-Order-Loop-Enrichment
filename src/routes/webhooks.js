@@ -116,6 +116,12 @@ router.post('/shopify/orders/create', async (req, res) => {
   // unset and the order carries no tags to sniff, which is exactly the case on
   // the renewals seen so far.
   let rewritten = false;
+  // Recorded so a questioned date can be explained later: what the order arrived
+  // with, and what the resolver locked onto.
+  let previousDeliveryDate = null;
+  let rewriteMatchedBy = null;
+  let rewriteScheduleSource = null;
+
   if (REWRITE_RENEWALS) {
     const state = needsRewrite(order);
     if (!state.stale) {
@@ -124,6 +130,7 @@ router.post('/shopify/orders/create', async (req, res) => {
       }
     } else {
       console.log(`[webhook] order ${orderId}: ${state.reason} — recomputing from the order date`);
+      previousDeliveryDate = state.current || null;
       try {
         const out = await rewriteRenewalOrder(order);
         if (!out.ok) {
@@ -145,11 +152,16 @@ router.post('/shopify/orders/create', async (req, res) => {
           const derivedOffset = cutoffFor(r.option).charge_offset_days;
           if (derivedOffset != null) chargeOffset = derivedOffset;
           rewritten = true;
+          rewriteMatchedBy = r.matched_by || null;
+          rewriteScheduleSource = out.schedule
+            ? `${out.schedule.deliveryDay || '?'} via ${out.schedule.derivedFrom}` +
+              (out.schedule.scheduleId ? ` (schedule ${out.schedule.scheduleId})` : '')
+            : null;
 
           console.log(
             `[webhook] order ${orderId}: dates rewritten — delivery ${r.delivery_date}, ` +
               `pack ${r.pack_date}, production ${r.production_date} ` +
-              `[kept on ${r.matched_by}]` +
+              `[matched ${r.matched_by}; weekday from ${rewriteScheduleSource}]` +
               (out.tag ? `, tag ${out.tag}` : '')
           );
         }
@@ -197,8 +209,9 @@ router.post('/shopify/orders/create', async (req, res) => {
     await pool.query(
       `INSERT INTO orders_to_enrich
          (order_id, delivery_date, delivery_location_id, delivery_time, suburb,
-          status, error_message, source, source_attributes)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+          status, error_message, source, source_attributes,
+          previous_delivery_date, rewrite_matched_by, rewrite_schedule_source)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        ON CONFLICT (order_id) DO NOTHING`,
       [
         orderId,
@@ -210,6 +223,9 @@ router.post('/shopify/orders/create', async (req, res) => {
         errorMessage,
         source,
         effectiveAttributes,
+        previousDeliveryDate,
+        rewriteMatchedBy,
+        rewriteScheduleSource,
       ]
     );
 
