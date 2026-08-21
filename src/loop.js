@@ -179,6 +179,39 @@ function editChargeOffsetRetrying(subscriptionId, chargeOffset, opts = {}) {
   });
 }
 
+// The subscription's OWN attributes — the source of truth for its delivery day.
+//
+// Loop has no deliveryDay field (checked every field on the subscription: only
+// deliveryPolicy {interval, intervalCount}, billingPolicy.anchorDay = null, and
+// nextBillingDateEpoch). The single record of a weekday is attributes[].Delivery-Date.
+//
+// Worth reading from the SUBSCRIPTION rather than the order copy: we rewrite the
+// order's attributes, so the order is no longer an independent witness to what the
+// customer originally chose. The subscription is.
+async function subscriptionContextForOrder(orderShopifyId) {
+  const res = await readSubscriptionByOrderId(orderShopifyId);
+  const subs = res?.data?.subscription;
+  const shopifyId = Array.isArray(subs) ? subs[0]?.shopifyId : undefined;
+  if (!shopifyId) return null;
+
+  const sub = await loopRequest('GET', `/subscription/shopify-${shopifyId}`);
+  const d = sub?.data || {};
+
+  const attributes = {};
+  for (const a of d.attributes || []) {
+    if (a?.key) attributes[a.key] = a.value;
+  }
+
+  return {
+    subscriptionId: `shopify-${shopifyId}`,
+    attributes,
+    chargeOffset: Number.isFinite(d.chargeOffset) ? d.chargeOffset : null,
+    nextBillingDateEpoch: d.nextBillingDateEpoch ?? null,
+    deliveryPolicy: d.deliveryPolicy || null,
+    completedOrdersCount: d.completedOrdersCount ?? null,
+  };
+}
+
 // Set the subscription's charge offset — the number of days Loop charges BEFORE
 // the scheduled delivery date. We send the HDS cutoff-days value here so the
 // renewal is charged at the HDS cutoff.
@@ -243,6 +276,7 @@ module.exports = {
   readSubscriptionByOrderId,
   subscriptionIdForOrder,
   subscriptionIdForOrderRetrying,
+  subscriptionContextForOrder,
   verifyLoopWebhook,
   loopRequest,
 };

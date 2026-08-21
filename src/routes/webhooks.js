@@ -7,7 +7,11 @@ const {
   getHdsAttributes,
   normalizeDate,
 } = require('../shopify');
-const { editChargeOffsetRetrying, subscriptionIdForOrderRetrying } = require('../loop');
+const {
+  editChargeOffsetRetrying,
+  subscriptionIdForOrderRetrying,
+  subscriptionContextForOrder,
+} = require('../loop');
 const { needsRewrite, rewriteRenewalOrder, cutoffFor } = require('../lib/renewal-rewrite');
 const { buildHdsAttributes } = require('../lib/renewal-date');
 const { legacyLabelUpdates, describeUpdates, isEnabled: renameEnabled } = require('../lib/legacy-labels');
@@ -116,6 +120,7 @@ router.post('/shopify/orders/create', async (req, res) => {
   // unset and the order carries no tags to sniff, which is exactly the case on
   // the renewals seen so far.
   let rewritten = false;
+  let loopSubscriptionIdEarly = null;
   // Recorded so a questioned date can be explained later: what the order arrived
   // with, and what the resolver locked onto.
   let previousDeliveryDate = null;
@@ -131,8 +136,22 @@ router.post('/shopify/orders/create', async (req, res) => {
     } else {
       console.log(`[webhook] order ${orderId}: ${state.reason} — recomputing from the order date`);
       previousDeliveryDate = state.current || null;
+
+      // Best effort: the subscription's own Delivery-Date is the authoritative
+      // weekday, but Loop may not have ingested this order yet. Falling back to
+      // the order's own attributes is fine — it is what we used before.
+      let subscriptionAttributes = null;
       try {
-        const out = await rewriteRenewalOrder(order);
+        const context = await subscriptionContextForOrder(orderId);
+        subscriptionAttributes = context?.attributes || null;
+        if (context) loopSubscriptionIdEarly = context.subscriptionId;
+      } catch (err) {
+        console.warn(
+          `[webhook] order ${orderId}: could not read the subscription for its delivery day — ${err.message}`
+        );
+      }
+      try {
+        const out = await rewriteRenewalOrder(order, { subscriptionAttributes });
         if (!out.ok) {
           console.warn(
             `[webhook] order ${orderId}: date rewrite skipped — ${out.reason}` +
@@ -242,8 +261,8 @@ router.post('/shopify/orders/create', async (req, res) => {
   // "shopify-{contractId}" id the Loop API expects). Worth doing whenever the
   // order looks subscription-related OR carries a charge offset to push.
   // loopSubscriptionId → Loop API calls; subscriptionId → our BIGINT column.
-  let loopSubscriptionId = null;
-  if (effectiveDeliveryDate || source === 'loop' || chargeOffset != null) {
+  let loopSubscriptionId = loopSubscriptionIdEarly;
+  if (!loopSubscriptionId && (effectiveDeliveryDate || source === 'loop' || chargeOffset != null)) {
     try {
       loopSubscriptionId = await subscriptionIdForOrderRetrying(orderId, {
         onRetry: (attempt, wait, err) =>
