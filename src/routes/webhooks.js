@@ -12,7 +12,7 @@ const {
   subscriptionIdForOrderRetrying,
   subscriptionContextForOrder,
 } = require('../loop');
-const { needsRewrite, rewriteRenewalOrder, cutoffFor } = require('../lib/renewal-rewrite');
+const { needsRewrite, rewriteRenewalOrder, cutoffFor, HELD_TAG } = require('../lib/renewal-rewrite');
 const { buildHdsAttributes } = require('../lib/renewal-date');
 const { legacyLabelUpdates, describeUpdates, isEnabled: renameEnabled } = require('../lib/legacy-labels');
 const { updateOrderAttributes } = require('../shopify');
@@ -198,6 +198,18 @@ router.post('/shopify/orders/create', async (req, res) => {
         rewriteFailed = true;
         console.error(`[webhook] order ${orderId}: date rewrite failed — ${describeError(err)}`);
       }
+    }
+  }
+
+  // The order still shows the expired dates, and nothing on the order page says so.
+  // Tag it, so ops and fulfilment can see the dates are not to be trusted instead of
+  // reading a plausible-looking date that has already passed.
+  if (rewriteFailed) {
+    try {
+      await updateOrderAttributes(orderId, { addTags: [HELD_TAG], order });
+      console.log(`[webhook] order ${orderId}: tagged ${HELD_TAG} — dates left as they arrived`);
+    } catch (err) {
+      console.warn(`[webhook] order ${orderId}: could not tag ${HELD_TAG} — ${describeError(err)}`);
     }
   }
 
