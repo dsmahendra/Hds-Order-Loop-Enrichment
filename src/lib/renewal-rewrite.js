@@ -173,6 +173,10 @@ function packDateTag(packDate) {
 
 const PACK_TAG_PREFIX = 'Pick-Pack-Date-';
 
+// Tagged onto an order whose dates could NOT be recomputed, so the expired ones it
+// still carries are visibly untrustworthy. Cleared the moment a rewrite succeeds.
+const HELD_TAG = 'HDS-Dates-Held';
+
 // Renamed keys. The rewrite removes these so a stale value cannot sit alongside
 // its replacement, leaving downstream unable to tell which one is authoritative.
 const SUPERSEDED_ATTRIBUTES = ['HDS Pack Date'];
@@ -459,7 +463,8 @@ async function rewriteRenewalOrder(order, { dryRun = false, subscriptionAttribut
   await updateOrderAttributes(orderId, {
     attributes,
     addTags: tag ? [tag] : [],
-    removeTagPrefixes: [PACK_TAG_PREFIX],
+    // Clear the held flag: these dates are now good.
+    removeTagPrefixes: [PACK_TAG_PREFIX, HELD_TAG],
     removeAttributes: SUPERSEDED_ATTRIBUTES,
     order,
   });
@@ -469,6 +474,7 @@ async function rewriteRenewalOrder(order, { dryRun = false, subscriptionAttribut
 
 module.exports = {
   needsRewrite,
+  HELD_TAG,
   selectionMode,
   SUPERSEDED_ATTRIBUTES,
   isPostcodeShaped,
