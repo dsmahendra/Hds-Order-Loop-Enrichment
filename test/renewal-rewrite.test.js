@@ -273,6 +273,56 @@ test('an order with no attributes at all is missing its HDS records', () => {
   assert.strictEqual(hasHdsRecords({}), false);
 });
 
+// --- additive writes ---------------------------------------------------------
+// On a store where other systems own the order, the fill must only ADD. A value
+// already on the order is never replaced, whatever we computed for it.
+
+test('a value already on the order is never replaced', () => {
+  const order = attrs({
+    'Delivery-Date': '2026/09/06',
+    'Delivery-Time': '6:00 AM - 6:00 PM',
+    'Delivery-Slot-Id': '140419042',
+  });
+
+  const kept = additiveOnly(order, {
+    'Delivery-Date': '2026/09/13', // we computed something different
+    'Delivery-Time': '12:00 AM - 7:00 AM',
+    'Pick-Pack-Date': '2026/09/04', // genuinely missing
+  });
+
+  assert.deepStrictEqual(kept, { 'Pick-Pack-Date': '2026/09/04' });
+});
+
+test('an empty existing value counts as missing and is filled', () => {
+  const order = attrs({ 'Pick-Pack-Date': '' });
+  assert.deepStrictEqual(additiveOnly(order, { 'Pick-Pack-Date': '2026/09/04' }), {
+    'Pick-Pack-Date': '2026/09/04',
+  });
+});
+
+test('an order with nothing on it takes everything offered', () => {
+  const kept = additiveOnly({ note_attributes: [] }, { 'Pick-Pack-Date': '2026/09/04', 'HDS Region': 'VIC' });
+  assert.strictEqual(Object.keys(kept).length, 2);
+});
+
+test('the fill scope defaults to the pack date alone', () => {
+  const saved = process.env.FILL_HDS_ATTRIBUTES;
+  try {
+    delete process.env.FILL_HDS_ATTRIBUTES;
+    assert.strictEqual(fillScope(), 'pack-date');
+
+    process.env.FILL_HDS_ATTRIBUTES = 'all-missing';
+    assert.strictEqual(fillScope(), 'all-missing');
+
+    // Anything unrecognised stays on the cautious setting.
+    process.env.FILL_HDS_ATTRIBUTES = 'everything';
+    assert.strictEqual(fillScope(), 'pack-date');
+  } finally {
+    if (saved === undefined) delete process.env.FILL_HDS_ATTRIBUTES;
+    else process.env.FILL_HDS_ATTRIBUTES = saved;
+  }
+});
+
 // --- the key NetSuite reads --------------------------------------------------
 // NetSuite reads Pick-Pack-Date. It is the one attribute another system depends on
 // by name, so it must survive any future renaming of the HDS * set.

@@ -573,6 +573,29 @@ module.exports = {
 // So keep the delivery date exactly as it is and derive the rest around it: find
 // the schedule for that suburb whose delivery weekday matches, and apply its own
 // pack and production gaps. Nothing the other app owns is touched.
+// How much to add to an order that another system scheduled.
+//
+//   pack-date (default)  add Pick-Pack-Date and nothing else
+//   all-missing          add every HDS field the order is missing
+//
+// Either way the write is ADDITIVE: a value the order already carries is never
+// replaced, so nothing here can change a date a customer was already told.
+function fillScope() {
+  return String(process.env.FILL_HDS_ATTRIBUTES || 'pack-date').toLowerCase() === 'all-missing'
+    ? 'all-missing'
+    : 'pack-date';
+}
+
+// Drop anything the order already has a value for, so the write can only add.
+function additiveOnly(order, attributes) {
+  return Object.fromEntries(
+    Object.entries(attributes).filter(([name]) => {
+      const existing = getNoteAttribute(order, name);
+      return existing === null || existing === undefined || existing === '';
+    })
+  );
+}
+
 function hasHdsRecords(order) {
   return Boolean(
     getNoteAttribute(order, 'HDS Ship Date') ||
@@ -641,31 +664,52 @@ async function fillHdsRecords(order, { dryRun = false } = {}) {
       cutoff_override: cutoffFor({ delivery_date: deliveryDate, cutoff_info: option.cutoff_info }),
     };
 
-    const attributes = buildOrderAttributes(resolved, {
+    const built = buildOrderAttributes(resolved, {
       preferredWindow: getNoteAttribute(order, 'HDS Delivery Window'),
     });
 
-    // Delivery-Time is written only when DELIVERY_WINDOW_TIMES maps the window —
-    // the same rule as the rewrite path. Unset, the order keeps whatever it has,
-    // which is what you want while another app still owns that field.
+    const scope = fillScope();
+    let attributes = additiveOnly(order, built);
+
+    if (scope === 'pack-date') {
+      // Just the one key NetSuite reads. Everything else the order already had
+      // stays exactly as it was.
+      attributes = attributes['Pick-Pack-Date']
+        ? { 'Pick-Pack-Date': attributes['Pick-Pack-Date'] }
+        : {};
+    }
+
+    if (!Object.keys(attributes).length) {
+      return {
+        ok: false,
+        reason:
+          scope === 'pack-date'
+            ? 'Pick-Pack-Date is already set — nothing to add'
+            : 'every HDS field already has a value — nothing to add',
+      };
+    }
 
     const tag = packDateTag(resolved.pack_date);
 
-    if (dryRun) return { ok: true, dryRun: true, resolved, attributes, tag, locationUsed: candidate };
+    if (dryRun) return { ok: true, dryRun: true, resolved, attributes, tag, locationUsed: candidate, scope };
 
     await updateOrderAttributes(orderId, {
       attributes,
       addTags: tag ? [tag] : [],
-      removeTagPrefixes: [PACK_TAG_PREFIX, HELD_TAG],
-      removeAttributes: SUPERSEDED_ATTRIBUTES,
+      // Additive: no tag stripped, no renamed key removed. This path adds what is
+      // missing; it does not tidy what is already there.
+      removeTagPrefixes: [],
+      removeAttributes: [],
       order,
     });
 
-    return { ok: true, resolved, attributes, tag, locationUsed: candidate };
+    return { ok: true, resolved, attributes, tag, locationUsed: candidate, scope };
   }
 
   return { ok: false, reason: attempts.join('; ') || 'no serviceable address on the order' };
 }
 
 module.exports.hasHdsRecords = hasHdsRecords;
+module.exports.additiveOnly = additiveOnly;
+module.exports.fillScope = fillScope;
 module.exports.fillHdsRecords = fillHdsRecords;
