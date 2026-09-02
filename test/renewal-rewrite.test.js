@@ -273,6 +273,43 @@ test('an order with no attributes at all is missing its HDS records', () => {
   assert.strictEqual(hasHdsRecords({}), false);
 });
 
+// --- the key NetSuite reads --------------------------------------------------
+// NetSuite reads Pick-Pack-Date. It is the one attribute another system depends on
+// by name, so it must survive any future renaming of the HDS * set.
+
+test('Pick-Pack-Date is written whenever a pack date was resolved', () => {
+  const a = buildOrderAttributes(RESOLVED);
+
+  assert.strictEqual(a['Pick-Pack-Date'], '2026/08/23');
+  assert.strictEqual(a['Pick-Pack-Date'], a['HDS Ship Date'], 'both carry the same pack date');
+});
+
+test('Pick-Pack-Date is not silently dropped when other fields are missing', () => {
+  // A schedule with no cutoff info loses Charge Offset, but the pack date stands.
+  const a = buildOrderAttributes({ ...RESOLVED, option: {} });
+
+  assert.ok(!('Charge Offset' in a));
+  assert.strictEqual(a['Pick-Pack-Date'], '2026/08/23');
+});
+
+test('Pick-Pack-Date is omitted rather than blank when there is no pack date', () => {
+  // Better absent than an empty string: NetSuite reading "" is worse than reading
+  // nothing, and the held tag flags the order either way.
+  const a = buildOrderAttributes({ ...RESOLVED, pack_date: null });
+
+  assert.ok(!('Pick-Pack-Date' in a));
+  assert.ok(!('HDS Ship Date' in a));
+});
+
+test('the pack-pack tag matches the Pick-Pack-Date value', () => {
+  const a = buildOrderAttributes(RESOLVED);
+  const tag = packDateTag(RESOLVED.pack_date);
+
+  // 2026/08/23 -> Pick-Pack-Date-23-08-2026
+  const [y, m, d] = a['Pick-Pack-Date'].split('/');
+  assert.strictEqual(tag, `Pick-Pack-Date-${d}-${m}-${y}`);
+});
+
 // --- the HDS Ship Date rename ------------------------------------------------
 
 test('buildOrderAttributes writes HDS Ship Date, not HDS Pack Date', () => {
