@@ -15,6 +15,8 @@ const {
   scheduleFor,
   locationCandidatesFor,
   hasHdsRecords,
+  additiveOnly,
+  fillScope,
 } = require('../src/lib/renewal-rewrite');
 const { mergeNoteAttributes, mergeTags } = require('../src/shopify');
 
