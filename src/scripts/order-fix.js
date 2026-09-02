@@ -9,6 +9,9 @@
 //   --order <id>   Shopify order id. Repeatable.
 //   --dry-run      Resolve and print the before/after, write nothing.
 //   --force        Rewrite even when the current Delivery-Date looks valid.
+//   --allow-rewrite Permit a date-replacing rewrite on a deployment where
+//                  REWRITE_RENEWAL_DATES=false. Without it, such a run is refused
+//                  and falls back to adding only what is missing.
 //   --no-requeue   Don't touch the enrichment queue row (default: requeue it
 //                  when DATABASE_URL is set, so the stale enrichment is redone).
 //
@@ -32,6 +35,7 @@ function parseArgs(argv) {
     if (a === '--order') opts.orders.push(argv[++i]);
     else if (a === '--dry-run') opts.dryRun = true;
     else if (a === '--force') opts.force = true;
+    else if (a === '--allow-rewrite') opts.allowRewrite = true;
     else if (a === '--no-requeue') opts.noRequeue = true;
     else if (!a.startsWith('--')) opts.orders.push(a);
     else throw new Error(`unknown flag ${a}`);
@@ -84,7 +88,25 @@ async function runOne(orderId, opts) {
 
   // Three cases: stale dates get recomputed; a valid date missing its HDS fields
   // gets those filled in around it; anything else needs --force.
-  const action = state.stale || opts.force ? 'rewrite' : missingHds ? 'fill' : 'skip';
+  let action = state.stale || opts.force ? 'rewrite' : missingHds ? 'fill' : 'skip';
+
+  // The rewrite REPLACES dates. When the service is configured not to do that -
+  // because another system owns this store's dates - the CLI must not quietly do
+  // it either, or a single --force undoes the guarantee for that order.
+  const rewriteStoodDown =
+    String(process.env.REWRITE_RENEWAL_DATES || 'true').toLowerCase() === 'false';
+
+  if (action === 'rewrite' && rewriteStoodDown && !opts.allowRewrite) {
+    console.log('  REFUSED — this would REPLACE existing dates, but REWRITE_RENEWAL_DATES=false');
+    console.log('            on this deployment, so dates are owned elsewhere.');
+    if (missingHds) {
+      console.log('            Filling in the missing records instead (adds only, changes nothing).');
+      action = 'fill';
+    } else {
+      console.log('            Pass --allow-rewrite if replacing them is genuinely intended.');
+      return { skipped: true };
+    }
+  }
 
   if (action === 'skip') {
     console.log('  skipped — dates look valid and the HDS records are already there');
