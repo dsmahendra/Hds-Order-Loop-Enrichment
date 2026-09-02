@@ -15,7 +15,7 @@
 // back onto the order, replacing Arigato in the pipeline.
 
 const { getNoteAttribute, normalizeDate, updateOrderAttributes } = require('../shopify');
-const { chooseDeliveryWindow, resolveRenewalDelivery } = require('./renewal-date');
+const { chooseDeliveryWindow, resolveRenewalDelivery, fetchDeliveryOptions } = require('./renewal-date');
 const {
   calculateNextDeliveryDate,
   formatLongDate,
@@ -560,3 +560,112 @@ module.exports = {
   locationFor,
   PACK_TAG_PREFIX,
 };
+
+// ---------------------------------------------------------------------------
+// Filling in the HDS records for an order scheduled by something else.
+//
+// Production orders come from Zapiet, not the HDS checkout: they carry
+// Delivery-Date, Delivery-Slot-Id and Delivery-Location-Id, and no HDS * fields
+// at all. Their delivery date is valid and in the future, so needsRewrite()
+// correctly leaves it alone — which meant nothing ever gave the kitchen a pack or
+// production date for them.
+//
+// So keep the delivery date exactly as it is and derive the rest around it: find
+// the schedule for that suburb whose delivery weekday matches, and apply its own
+// pack and production gaps. Nothing the other app owns is touched.
+function hasHdsRecords(order) {
+  return Boolean(
+    getNoteAttribute(order, 'HDS Ship Date') ||
+      getNoteAttribute(order, 'HDS Pack Date') ||
+      getNoteAttribute(order, 'HDS Production Date') ||
+      getNoteAttribute(order, 'Pick-Pack-Date')
+  );
+}
+
+async function fillHdsRecords(order, { dryRun = false } = {}) {
+  const orderId = order?.id;
+  if (!orderId) return { ok: false, reason: 'order payload has no id' };
+
+  const raw = getNoteAttribute(order, 'Delivery-Date') || getNoteAttribute(order, 'HDS Delivery Date');
+  if (!raw) return { ok: false, reason: 'no Delivery-Date to derive the pack date from' };
+  const deliveryDate = normalizeDate(raw);
+
+  const wanted = weekdayOf(deliveryDate);
+  if (!wanted) return { ok: false, reason: `unparseable Delivery-Date: ${raw}` };
+
+  const candidates = locationCandidatesFor(order);
+  if (!candidates.length) return { ok: false, reason: 'no postcode and suburb to look up' };
+
+  const attempts = [];
+  for (const candidate of candidates) {
+    const res = await fetchDeliveryOptions({ postcode: candidate.postcode, suburb: candidate.suburb });
+    if (!res.ok) {
+      attempts.push(`${candidate.suburb} ${candidate.postcode} (${candidate.source}): ${res.reason}`);
+      continue;
+    }
+
+    const options = Array.isArray(res.data.delivery_options) ? res.data.delivery_options : [];
+    // Match the weekday, not the date: HDS drops options whose cutoff has passed,
+    // so the order's own date is usually no longer listed even though its schedule
+    // still exists.
+    const option = options.find(
+      (o) => String(o.delivery_day).toLowerCase() === String(wanted).toLowerCase()
+    );
+    if (!option) {
+      attempts.push(
+        `${candidate.suburb} ${candidate.postcode}: no ${wanted} schedule ` +
+          `(offers ${[...new Set(options.map((o) => o.delivery_day))].join(', ') || 'nothing'})`
+      );
+      continue;
+    }
+
+    const packGap = daysBetween(option.delivery_date, option.pack_date);
+    const productionGap = daysBetween(option.delivery_date, option.production_date);
+
+    const resolved = {
+      charge_date: String(order.created_at || '').slice(0, 10) || null,
+      matched_by: `${wanted} schedule ${option.schedule_id} (delivery date kept as it was)`,
+      delivery_date: deliveryDate,
+      pack_date: packGap == null ? null : subtractDays(deliveryDate, packGap),
+      production_date: productionGap == null ? null : subtractDays(deliveryDate, productionGap),
+      region: res.data.region?.name || null,
+      suburb: res.data.suburb?.name || candidate.suburb,
+      postcode: res.data.suburb?.postcode || candidate.postcode,
+      schedule_id: option.schedule_id ?? null,
+      delivery_day: option.delivery_day || wanted,
+      delivery_window: option.delivery_window || null,
+      formatted_date: formatLongDate(deliveryDate),
+      option,
+      // The cutoff for THIS delivery date, from the schedule's own cutoff weekday.
+      // Not the order date: these orders are not charged at the HDS cutoff.
+      cutoff_override: cutoffFor({ delivery_date: deliveryDate, cutoff_info: option.cutoff_info }),
+    };
+
+    const attributes = buildOrderAttributes(resolved, {
+      preferredWindow: getNoteAttribute(order, 'HDS Delivery Window'),
+    });
+
+    // Delivery-Time belongs to whichever app scheduled this order; the window it
+    // shows the customer is not ours to restate.
+    delete attributes['Delivery-Time'];
+
+    const tag = packDateTag(resolved.pack_date);
+
+    if (dryRun) return { ok: true, dryRun: true, resolved, attributes, tag, locationUsed: candidate };
+
+    await updateOrderAttributes(orderId, {
+      attributes,
+      addTags: tag ? [tag] : [],
+      removeTagPrefixes: [PACK_TAG_PREFIX, HELD_TAG],
+      removeAttributes: SUPERSEDED_ATTRIBUTES,
+      order,
+    });
+
+    return { ok: true, resolved, attributes, tag, locationUsed: candidate };
+  }
+
+  return { ok: false, reason: attempts.join('; ') || 'no serviceable address on the order' };
+}
+
+module.exports.hasHdsRecords = hasHdsRecords;
+module.exports.fillHdsRecords = fillHdsRecords;

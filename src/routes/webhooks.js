@@ -12,7 +12,14 @@ const {
   subscriptionIdForOrderRetrying,
   subscriptionContextForOrder,
 } = require('../loop');
-const { needsRewrite, rewriteRenewalOrder, cutoffFor, HELD_TAG } = require('../lib/renewal-rewrite');
+const {
+  needsRewrite,
+  rewriteRenewalOrder,
+  cutoffFor,
+  HELD_TAG,
+  hasHdsRecords,
+  fillHdsRecords,
+} = require('../lib/renewal-rewrite');
 const { buildHdsAttributes } = require('../lib/renewal-date');
 const { legacyLabelUpdates, describeUpdates, isEnabled: renameEnabled } = require('../lib/legacy-labels');
 const { updateOrderAttributes } = require('../shopify');
@@ -23,6 +30,12 @@ const { updateOrderAttributes } = require('../shopify');
 // write to the same order).
 const REWRITE_RENEWALS =
   String(process.env.REWRITE_RENEWAL_DATES || 'true').toLowerCase() !== 'false';
+
+// Orders scheduled by another app (Zapiet on production) arrive with a valid
+// future Delivery-Date and no HDS fields at all, so the rewrite rightly leaves
+// them alone — and nothing was giving the kitchen a pack or production date for
+// them. This fills those in AROUND the existing delivery date.
+const FILL_HDS = String(process.env.FILL_HDS_RECORDS || 'true').toLowerCase() !== 'false';
 
 // Some errors (a bad DATABASE_URL among them) arrive with an empty message, which
 // logs as "failed to queue order: " and says nothing. Fall back to whatever the
@@ -141,6 +154,36 @@ router.post('/shopify/orders/create', async (req, res) => {
     if (!state.stale) {
       if (source === 'loop') {
         console.log(`[webhook] order ${orderId}: ${state.reason} — no date rewrite needed`);
+      }
+
+      // The date is fine but the HDS fields may be missing entirely.
+      if (FILL_HDS && !hasHdsRecords(order)) {
+        console.log(
+          `[webhook] order ${orderId}: has a delivery date but no HDS records — filling them in`
+        );
+        try {
+          const filled = await fillHdsRecords(order);
+          if (!filled.ok) {
+            console.warn(`[webhook] order ${orderId}: could not fill HDS records — ${filled.reason}`);
+          } else {
+            const r = filled.resolved;
+            effectiveDeliveryDate = r.delivery_date;
+            effectiveSuburb = r.suburb || effectiveSuburb;
+            effectivePostcode = r.postcode || effectivePostcode;
+            effectiveAttributes = buildHdsAttributes(r, filled.attributes['HDS Delivery Window']);
+            rewriteMatchedBy = r.matched_by || null;
+            rewriteScheduleSource = filled.locationUsed
+              ? `${filled.locationUsed.suburb} ${filled.locationUsed.postcode} via ${filled.locationUsed.source}`
+              : null;
+            console.log(
+              `[webhook] order ${orderId}: HDS records added — delivery ${r.delivery_date} kept, ` +
+                `ship ${r.pack_date}, production ${r.production_date} [${r.matched_by}]` +
+                (filled.tag ? `, tag ${filled.tag}` : '')
+            );
+          }
+        } catch (err) {
+          console.error(`[webhook] order ${orderId}: filling HDS records failed — ${describeError(err)}`);
+        }
       }
     } else {
       console.log(`[webhook] order ${orderId}: ${state.reason} — recomputing from the order date`);

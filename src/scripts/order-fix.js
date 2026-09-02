@@ -16,7 +16,13 @@
 
 require('dotenv').config();
 const { getOrder, getNoteAttribute, describeAdminToken } = require('../shopify');
-const { needsRewrite, rewriteRenewalOrder, locationFor } = require('../lib/renewal-rewrite');
+const {
+  needsRewrite,
+  rewriteRenewalOrder,
+  locationFor,
+  hasHdsRecords,
+  fillHdsRecords,
+} = require('../lib/renewal-rewrite');
 const { buildHdsAttributes } = require('../lib/renewal-date');
 
 function parseArgs(argv) {
@@ -73,17 +79,30 @@ async function runOne(orderId, opts) {
               `, Pick-Pack-Date ${getNoteAttribute(order, 'Pick-Pack-Date') || '(none)'}`);
   console.log(`  verdict        : ${state.stale ? 'STALE' : 'looks valid'} — ${state.reason}`);
 
-  if (!state.stale && !opts.force) {
-    console.log('  skipped (pass --force to rewrite anyway)');
+  const missingHds = !hasHdsRecords(order);
+  console.log(`  HDS records    : ${missingHds ? 'MISSING — will be filled in' : 'present'}`);
+
+  // Three cases: stale dates get recomputed; a valid date missing its HDS fields
+  // gets those filled in around it; anything else needs --force.
+  const action = state.stale || opts.force ? 'rewrite' : missingHds ? 'fill' : 'skip';
+
+  if (action === 'skip') {
+    console.log('  skipped — dates look valid and the HDS records are already there');
+    console.log('            (pass --force to recompute anyway)');
     return { skipped: true };
   }
 
-  const out = await rewriteRenewalOrder(order, { dryRun: opts.dryRun });
+  const out =
+    action === 'fill'
+      ? await fillHdsRecords(order, { dryRun: opts.dryRun })
+      : await rewriteRenewalOrder(order, { dryRun: opts.dryRun });
+
+  if (action === 'fill') console.log('  action         : keeping the delivery date, adding the HDS records');
   if (!out.ok) {
     throw new Error(out.reason + (out.schedule ? ` (schedule from ${out.schedule.derivedFrom})` : ''));
   }
 
-  console.log(
+  if (out.schedule) console.log(
     `  keeping        : ${out.schedule.deliveryDay || '?'} deliveries` +
       ` (schedule ${out.schedule.scheduleId || 'n/a'}, from ${out.schedule.derivedFrom})` +
       ` -> matched on ${out.resolved.matched_by}`
