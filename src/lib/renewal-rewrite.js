@@ -645,9 +645,9 @@ async function fillHdsRecords(order, { dryRun = false } = {}) {
       preferredWindow: getNoteAttribute(order, 'HDS Delivery Window'),
     });
 
-    // Delivery-Time belongs to whichever app scheduled this order; the window it
-    // shows the customer is not ours to restate.
-    delete attributes['Delivery-Time'];
+    // Delivery-Time is written only when DELIVERY_WINDOW_TIMES maps the window —
+    // the same rule as the rewrite path. Unset, the order keeps whatever it has,
+    // which is what you want while another app still owns that field.
 
     const tag = packDateTag(resolved.pack_date);
 
