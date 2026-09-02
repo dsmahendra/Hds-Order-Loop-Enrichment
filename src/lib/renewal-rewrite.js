@@ -194,23 +194,65 @@ function isPostcodeShaped(value) {
   return /^\d{4}$/.test(String(value == null ? '' : value).trim());
 }
 
-function locationFor(order) {
+// Where to look up the schedule, in priority order.
+//
+// The SHIPPING ADDRESS comes first. It is where the parcel actually goes, and on a
+// renewal it is current — whereas HDS Postcode / HDS Suburb are copies of the first
+// cycle, so a customer who has moved would otherwise be scheduled against the
+// suburb they left.
+//
+// The labelled attributes stay as a fallback because they hold HDS's own canonical
+// suburb spelling, which resolves when a free-text shipping city does not.
+function locationCandidatesFor(order) {
   const locationId = getNoteAttribute(order, 'Delivery-Location-Id');
 
-  const postcode =
-    getNoteAttribute(order, 'HDS Postcode') ||
-    getNoteAttribute(order, 'hds_postcode') ||
-    order?.shipping_address?.zip ||
-    (isPostcodeShaped(locationId) ? String(locationId).trim() : null) ||
-    null;
+  const shipped = {
+    postcode: order?.shipping_address?.zip ? String(order.shipping_address.zip).trim() : null,
+    suburb: order?.shipping_address?.city ? String(order.shipping_address.city).trim() : null,
+    source: 'shipping address',
+  };
 
-  const suburb =
-    getNoteAttribute(order, 'HDS Suburb') ||
-    getNoteAttribute(order, 'hds_suburb') ||
-    order?.shipping_address?.city ||
-    null;
+  const labelled = {
+    postcode:
+      getNoteAttribute(order, 'HDS Postcode') ||
+      getNoteAttribute(order, 'hds_postcode') ||
+      (isPostcodeShaped(locationId) ? String(locationId).trim() : null),
+    suburb: getNoteAttribute(order, 'HDS Suburb') || getNoteAttribute(order, 'hds_suburb'),
+    source: 'HDS attributes on the order',
+  };
 
-  return { postcode, suburb };
+  const candidates = [shipped, labelled].filter((c) => c.postcode && c.suburb);
+
+  // Drop a duplicate second attempt when both agree.
+  if (
+    candidates.length === 2 &&
+    String(candidates[0].postcode) === String(candidates[1].postcode) &&
+    String(candidates[0].suburb).toLowerCase() === String(candidates[1].suburb).toLowerCase()
+  ) {
+    return [candidates[0]];
+  }
+  return candidates;
+}
+
+// The single best guess, for diagnostics and for reporting what is missing.
+function locationFor(order) {
+  const candidates = locationCandidatesFor(order);
+  if (candidates.length) return { postcode: candidates[0].postcode, suburb: candidates[0].suburb };
+
+  const locationId = getNoteAttribute(order, 'Delivery-Location-Id');
+  return {
+    postcode:
+      order?.shipping_address?.zip ||
+      getNoteAttribute(order, 'HDS Postcode') ||
+      getNoteAttribute(order, 'hds_postcode') ||
+      (isPostcodeShaped(locationId) ? String(locationId).trim() : null) ||
+      null,
+    suburb:
+      order?.shipping_address?.city ||
+      getNoteAttribute(order, 'HDS Suburb') ||
+      getNoteAttribute(order, 'hds_suburb') ||
+      null,
+  };
 }
 
 // DAY_INDEX read backwards — one day table, not two.
@@ -389,10 +431,16 @@ async function rewriteRenewalOrder(order, { dryRun = false, subscriptionAttribut
   const orderId = order?.id;
   if (!orderId) return { ok: false, reason: 'order payload has no id' };
 
-  const { postcode, suburb } = locationFor(order);
-  if (!postcode) return { ok: false, reason: 'no postcode on the order (HDS Postcode / shipping address)' };
-  // The HDS API requires both; a postcode alone returns 400.
-  if (!suburb) return { ok: false, reason: 'no suburb on the order (HDS Suburb / shipping city)' };
+  const candidates = locationCandidatesFor(order);
+  if (!candidates.length) {
+    const partial = locationFor(order);
+    return {
+      ok: false,
+      reason: !partial.postcode
+        ? 'no postcode on the order (shipping address / HDS Postcode)'
+        : 'no suburb on the order (shipping city / HDS Suburb)',
+    };
+  }
 
   const orderDate = String(order.created_at || '').slice(0, 10);
   if (!orderDate) return { ok: false, reason: 'order has no created_at to resolve against' };
@@ -406,16 +454,36 @@ async function rewriteRenewalOrder(order, { dryRun = false, subscriptionAttribut
   // no weekday is taken from the subscription at all.
   const orderWeekday = weekdayOf(orderDate);
 
-  let result = await resolveRenewalDelivery({
-    postcode,
-    suburb,
-    chargeDateIso: order.created_at,
-    // Never scheduleId: it pins a weekday AND a window, so a stale id silently
-    // overrides whatever was resolved here.
-    scheduleId: null,
-    cutoffDay: mode === 'cutoff-day' ? orderWeekday : null,
-    deliveryDay: mode === 'keep-weekday' ? schedule.deliveryDay : null,
-  });
+  // Try the shipping address first, then the labelled attributes. A free-text
+  // shipping city HDS does not recognise should not cost us the lookup when the
+  // order also carries HDS's own canonical spelling.
+  let result = null;
+  let locationUsed = null;
+  const locationAttempts = [];
+
+  for (const candidate of candidates) {
+    result = await resolveRenewalDelivery({
+      postcode: candidate.postcode,
+      suburb: candidate.suburb,
+      chargeDateIso: order.created_at,
+      // Never scheduleId: it pins a weekday AND a window, so a stale id silently
+      // overrides whatever was resolved here.
+      scheduleId: null,
+      cutoffDay: mode === 'cutoff-day' ? orderWeekday : null,
+      deliveryDay: mode === 'keep-weekday' ? schedule.deliveryDay : null,
+    });
+
+    if (result.ok) {
+      locationUsed = candidate;
+      break;
+    }
+    locationAttempts.push(`${candidate.suburb} ${candidate.postcode} (${candidate.source}): ${result.reason}`);
+  }
+
+  if (!result.ok && locationAttempts.length > 1) {
+    // Report every address tried, so "not serviceable" names which ones failed.
+    result = { ok: false, reason: locationAttempts.join('; ') };
+  }
 
   // HDS is authoritative. Weekday arithmetic only stands in when HDS has no
   // option for this weekday at all, and only when explicitly enabled, because it
@@ -458,7 +526,7 @@ async function rewriteRenewalOrder(order, { dryRun = false, subscriptionAttribut
   });
   const tag = packDateTag(resolved.pack_date);
 
-  if (dryRun) return { ok: true, dryRun: true, resolved, attributes, tag, orderDate, schedule, usedFallback };
+  if (dryRun) return { ok: true, dryRun: true, resolved, attributes, tag, orderDate, schedule, usedFallback, locationUsed };
 
   await updateOrderAttributes(orderId, {
     attributes,
@@ -469,11 +537,12 @@ async function rewriteRenewalOrder(order, { dryRun = false, subscriptionAttribut
     order,
   });
 
-  return { ok: true, resolved, attributes, tag, orderDate, schedule, usedFallback };
+  return { ok: true, resolved, attributes, tag, orderDate, schedule, usedFallback, locationUsed };
 }
 
 module.exports = {
   needsRewrite,
+  locationCandidatesFor,
   HELD_TAG,
   selectionMode,
   SUPERSEDED_ATTRIBUTES,
