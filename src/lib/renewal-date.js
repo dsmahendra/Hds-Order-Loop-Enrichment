@@ -257,6 +257,7 @@ function buildHdsAttributes(resolved, preferredWindow = null) {
 
 module.exports = {
   resolveRenewalDelivery,
+  fetchDeliveryOptions,
   cutoffWeekdayOf,
   buildHdsAttributes,
   chooseDeliveryWindow,

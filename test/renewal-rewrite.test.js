@@ -14,6 +14,7 @@ const {
   SUPERSEDED_ATTRIBUTES,
   scheduleFor,
   locationCandidatesFor,
+  hasHdsRecords,
 } = require('../src/lib/renewal-rewrite');
 const { mergeNoteAttributes, mergeTags } = require('../src/shopify');
 
@@ -238,6 +239,38 @@ test('invalid DELIVERY_WINDOW_TIMES fails safe instead of throwing', () => {
   withWindowTimes('{not json', () => {
     assert.ok(!('Delivery-Time' in buildOrderAttributes(RESOLVED)));
   });
+});
+
+// --- orders scheduled by another app -----------------------------------------
+// Production orders come from Zapiet: a valid future Delivery-Date, a slot id, and
+// no HDS fields. The date is right, so only the HDS records need adding.
+
+test('an order with no HDS fields is detected as missing them', () => {
+  const zapietOrder = attrs({
+    'Delivery-Location-Id': '290879',
+    'Delivery-Date': '2026/09/06',
+    'Delivery-Time': '6:00 AM - 6:00 PM',
+    'Delivery-Slot-Id': '140419042',
+    'Checkout-Method': 'delivery',
+  });
+
+  assert.strictEqual(hasHdsRecords(zapietOrder), false);
+});
+
+test('any one of the HDS date fields counts as present', () => {
+  for (const key of ['HDS Ship Date', 'HDS Pack Date', 'HDS Production Date', 'Pick-Pack-Date']) {
+    assert.strictEqual(hasHdsRecords(attrs({ [key]: '2026/09/04' })), true, `${key} should count`);
+  }
+});
+
+test('HDS Region alone does not count — it carries no date', () => {
+  // Region without a pack date leaves the kitchen with nothing to work from.
+  assert.strictEqual(hasHdsRecords(attrs({ 'HDS Region': 'VIC Melbourne Metro' })), false);
+});
+
+test('an order with no attributes at all is missing its HDS records', () => {
+  assert.strictEqual(hasHdsRecords({ note_attributes: [] }), false);
+  assert.strictEqual(hasHdsRecords({}), false);
 });
 
 // --- the HDS Ship Date rename ------------------------------------------------
