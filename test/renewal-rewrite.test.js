@@ -13,6 +13,7 @@ const {
   previousTuple,
   SUPERSEDED_ATTRIBUTES,
   scheduleFor,
+  locationCandidatesFor,
 } = require('../src/lib/renewal-rewrite');
 const { mergeNoteAttributes, mergeTags } = require('../src/shopify');
 
@@ -344,12 +345,44 @@ test('isPostcodeShaped admits only four-digit values', () => {
   }
 });
 
-test('locationFor prefers the labelled HDS keys over the shipping address', () => {
+test('the shipping address is tried first — it is where the parcel goes', () => {
+  // On a renewal the labelled keys are a copy of the FIRST cycle, so a customer
+  // who has moved would otherwise be scheduled against the suburb they left.
   const loc = locationFor({
-    shipping_address: { city: 'Somewhere Else', zip: '9999' },
-    ...attrs({ 'HDS Postcode': '2176', 'HDS Suburb': 'PRAIRIEWOOD' }),
+    shipping_address: { city: 'Geebung', zip: '4034' },
+    ...attrs({ 'HDS Postcode': '2170', 'HDS Suburb': 'PRESTONS' }),
   });
-  assert.deepStrictEqual(loc, { postcode: '2176', suburb: 'PRAIRIEWOOD' });
+  assert.deepStrictEqual(loc, { postcode: '4034', suburb: 'Geebung' });
+});
+
+test('a moved customer yields both addresses, current one first', () => {
+  const candidates = locationCandidatesFor({
+    shipping_address: { city: 'Geebung', zip: '4034' },
+    ...attrs({ 'HDS Postcode': '2170', 'HDS Suburb': 'PRESTONS' }),
+  });
+
+  assert.strictEqual(candidates.length, 2);
+  assert.strictEqual(candidates[0].postcode, '4034');
+  assert.match(candidates[0].source, /shipping address/);
+  // The labelled pair stays as a fallback: it holds HDS's canonical spelling,
+  // which resolves when a free-text shipping city does not.
+  assert.strictEqual(candidates[1].postcode, '2170');
+});
+
+test('matching addresses are not looked up twice', () => {
+  const candidates = locationCandidatesFor({
+    shipping_address: { city: 'Prestons', zip: '2170' },
+    ...attrs({ 'HDS Postcode': '2170', 'HDS Suburb': 'PRESTONS' }),
+  });
+  assert.strictEqual(candidates.length, 1, 'case differs but the address is the same');
+});
+
+test('the labelled pair is used when there is no shipping address', () => {
+  const candidates = locationCandidatesFor(
+    attrs({ 'HDS Postcode': '2176', 'HDS Suburb': 'PRAIRIEWOOD' })
+  );
+  assert.strictEqual(candidates.length, 1);
+  assert.strictEqual(candidates[0].suburb, 'PRAIRIEWOOD');
 });
 
 // --- merge semantics ---------------------------------------------------------
