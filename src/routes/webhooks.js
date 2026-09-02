@@ -155,36 +155,6 @@ router.post('/shopify/orders/create', async (req, res) => {
       if (source === 'loop') {
         console.log(`[webhook] order ${orderId}: ${state.reason} — no date rewrite needed`);
       }
-
-      // The date is fine but the HDS fields may be missing entirely.
-      if (FILL_HDS && !hasHdsRecords(order)) {
-        console.log(
-          `[webhook] order ${orderId}: has a delivery date but no HDS records — filling them in`
-        );
-        try {
-          const filled = await fillHdsRecords(order);
-          if (!filled.ok) {
-            console.warn(`[webhook] order ${orderId}: could not fill HDS records — ${filled.reason}`);
-          } else {
-            const r = filled.resolved;
-            effectiveDeliveryDate = r.delivery_date;
-            effectiveSuburb = r.suburb || effectiveSuburb;
-            effectivePostcode = r.postcode || effectivePostcode;
-            effectiveAttributes = buildHdsAttributes(r, filled.attributes['HDS Delivery Window']);
-            rewriteMatchedBy = r.matched_by || null;
-            rewriteScheduleSource = filled.locationUsed
-              ? `${filled.locationUsed.suburb} ${filled.locationUsed.postcode} via ${filled.locationUsed.source}`
-              : null;
-            console.log(
-              `[webhook] order ${orderId}: HDS records added — delivery ${r.delivery_date} kept, ` +
-                `ship ${r.pack_date}, production ${r.production_date} [${r.matched_by}]` +
-                (filled.tag ? `, tag ${filled.tag}` : '')
-            );
-          }
-        } catch (err) {
-          console.error(`[webhook] order ${orderId}: filling HDS records failed — ${describeError(err)}`);
-        }
-      }
     } else {
       console.log(`[webhook] order ${orderId}: ${state.reason} — recomputing from the order date`);
       previousDeliveryDate = state.current || null;
@@ -240,6 +210,50 @@ router.post('/shopify/orders/create', async (req, res) => {
       } catch (err) {
         rewriteFailed = true;
         console.error(`[webhook] order ${orderId}: date rewrite failed — ${describeError(err)}`);
+      }
+    }
+  }
+
+  // Independent of REWRITE_RENEWAL_DATES on purpose.
+  //
+  // While another app still owns this store's delivery dates, rewriting is stood
+  // down — but an order whose date is fine and simply has NO HDS fields still needs
+  // them, and adding those changes no date. Nesting this inside the rewrite switch
+  // meant standing one down stood down the other, which is the opposite of what a
+  // staged cutover needs.
+  //
+  // Never fills around a STALE date: deriving a pack date from an expired delivery
+  // date would hand the kitchen something already in the past.
+  if (FILL_HDS && !rewritten && !rewriteFailed && !hasHdsRecords(order)) {
+    const stale = needsRewrite(order).stale;
+    if (stale) {
+      console.log(
+        `[webhook] order ${orderId}: no HDS records, but its delivery date is expired — not deriving from it`
+      );
+    } else {
+      console.log(`[webhook] order ${orderId}: has a delivery date but no HDS records — filling them in`);
+      try {
+        const filled = await fillHdsRecords(order);
+        if (!filled.ok) {
+          console.warn(`[webhook] order ${orderId}: could not fill HDS records — ${filled.reason}`);
+        } else {
+          const r = filled.resolved;
+          effectiveDeliveryDate = r.delivery_date;
+          effectiveSuburb = r.suburb || effectiveSuburb;
+          effectivePostcode = r.postcode || effectivePostcode;
+          effectiveAttributes = buildHdsAttributes(r, filled.attributes['HDS Delivery Window']);
+          rewriteMatchedBy = r.matched_by || null;
+          rewriteScheduleSource = filled.locationUsed
+            ? `${filled.locationUsed.suburb} ${filled.locationUsed.postcode} via ${filled.locationUsed.source}`
+            : null;
+          console.log(
+            `[webhook] order ${orderId}: HDS records added — delivery ${r.delivery_date} kept, ` +
+              `ship ${r.pack_date}, production ${r.production_date} [${r.matched_by}]` +
+              (filled.tag ? `, tag ${filled.tag}` : '')
+          );
+        }
+      } catch (err) {
+        console.error(`[webhook] order ${orderId}: filling HDS records failed — ${describeError(err)}`);
       }
     }
   }
