@@ -20,16 +20,8 @@
 require('dotenv').config();
 const { getOrder, getNoteAttribute, describeAdminToken } = require('../shopify');
 const { resolveAdminToken } = require('../shopify-tokens');
-const {
-  needsRewrite,
-  rewriteRenewalOrder,
-  locationFor,
-  hasHdsRecords,
-  fillHdsRecords,
-} = require('../lib/renewal-rewrite');
-const { missingTags } = require('../lib/order-tags');
-const { subscriptionContextForOrder } = require('../loop');
-const { updateOrderAttributes } = require('../shopify');
+const { needsRewrite, locationFor } = require('../lib/renewal-rewrite');
+const { applyHdsToOrder, planFor, rewriteEnabled, hasDeliveryDate } = require('../lib/apply-hds');
 const { buildHdsAttributes } = require('../lib/renewal-date');
 
 function parseArgs(argv) {
@@ -80,86 +72,54 @@ async function runOne(orderId, opts) {
   const { postcode, suburb } = locationFor(order);
   const state = needsRewrite(order);
 
-  console.log(`\n=== order ${orderId} (${order.name || ''}) ===`);
+  console.log(`
+=== order ${orderId} (${order.name || ''}) ===`);
   console.log(`  ordered        : ${String(order.created_at).slice(0, 10)}`);
   console.log(`  location       : ${postcode || '?'} / ${suburb || '?'}`);
-  console.log(`  current dates  : Delivery-Date ${getNoteAttribute(order, 'Delivery-Date') || '(none)'}` +
-              `, Pick-Pack-Date ${getNoteAttribute(order, 'Pick-Pack-Date') || '(none)'}`);
+  console.log(
+    `  current dates  : Delivery-Date ${getNoteAttribute(order, 'Delivery-Date') || '(none)'}` +
+      `, Pick-Pack-Date ${getNoteAttribute(order, 'Pick-Pack-Date') || '(none)'}`
+  );
   console.log(`  verdict        : ${state.stale ? 'STALE' : 'looks valid'} — ${state.reason}`);
 
-  const missingHds = !hasHdsRecords(order);
-  console.log(`  HDS records    : ${missingHds ? 'MISSING — will be filled in' : 'present'}`);
+  const plan = planFor(order);
+  console.log(`  plan           : ${plan.action} — ${plan.reason}`);
 
-  // Three cases: stale dates get recomputed; a valid date missing its HDS fields
-  // gets those filled in around it; anything else needs --force.
-  let action = state.stale || opts.force ? 'rewrite' : missingHds ? 'fill' : 'skip';
-
-  // The rewrite REPLACES dates. When the service is configured not to do that -
-  // because another system owns this store's dates - the CLI must not quietly do
-  // it either, or a single --force undoes the guarantee for that order.
-  const rewriteStoodDown =
-    String(process.env.REWRITE_RENEWAL_DATES || 'true').toLowerCase() === 'false';
-
-  if (action === 'rewrite' && rewriteStoodDown && !opts.allowRewrite) {
-    console.log('  REFUSED — this would REPLACE existing dates, but REWRITE_RENEWAL_DATES=false');
-    console.log('            on this deployment, so dates are owned elsewhere.');
-    if (missingHds) {
-      console.log('            Filling in the missing records instead (adds only, changes nothing).');
-      action = 'fill';
-    } else {
-      console.log('            Pass --allow-rewrite if replacing them is genuinely intended.');
-      return { skipped: true };
-    }
+  // A forced rewrite REPLACES dates. When the deployment is configured not to,
+  // the CLI must not quietly do it either.
+  if (opts.force && !rewriteEnabled() && hasDeliveryDate(order) && !opts.allowRewrite) {
+    console.log('  REFUSED — --force would REPLACE existing dates, but REWRITE_RENEWAL_DATES=false');
+    console.log('            Pass --allow-rewrite if that is genuinely intended.');
+    console.log('            Continuing without --force instead.');
+    opts.force = false;
   }
 
-  if (action === 'skip') {
-    // The dates are all present, but the tags may still be absent — which is the
-    // normal state of a checkout order now that nothing else tags them.
-    // Loop supplies the subscription tags; without it only the date tags are added.
-    let context = null;
-    try {
-      context = await subscriptionContextForOrder(orderId);
-    } catch {
-      // Not a subscription, or Loop has not ingested it — date tags still apply.
-    }
+  if (plan.action === 'hold') {
+    console.log('  held — an expired date cannot be recomputed while rewriting is stood down');
+    console.log('         set REWRITE_RENEWAL_DATES=true, or pass --allow-rewrite');
+    if (!opts.allowRewrite) return { skipped: true };
+  }
 
-    const missing = missingTags(order, context);
-    if (missing.length) {
-      console.log('  action         : dates are complete; adding the missing tags');
-      console.log(`  tags to add    : ${missing.join(', ')}`);
-      if (opts.dryRun) {
-        console.log('  [dry-run] nothing written');
-        return { dryRun: true };
-      }
-      await updateOrderAttributes(orderId, { addTags: missing, order });
-      console.log('  ✓ tags written to the Shopify order');
-      return { written: true };
-    }
+  // atCreation stays false: a backfill must not stamp today's billing cycle on an
+  // order charged weeks ago.
+  const out = await applyHdsToOrder(order, {
+    dryRun: opts.dryRun,
+    atCreation: false,
+    force: opts.force,
+  });
 
-    console.log('  skipped — dates and tags are all present');
-    console.log('            (pass --force to recompute the dates anyway)');
+  if (!out.ok) throw new Error(out.reason);
+
+  if (out.wrote && Object.keys(out.wrote).length) {
+    console.log('  new values     :');
+    for (const [k, v] of Object.entries(out.wrote)) console.log(`     ${k.padEnd(24)} ${v}`);
+  }
+  if (out.tagsAdded.length) console.log(`  tags           : ${out.tagsAdded.join(', ')}`);
+
+  if (!out.wrote && !out.tagsAdded.length) {
+    console.log('  nothing to do — dates and tags are all present');
     return { skipped: true };
   }
-
-  const out =
-    action === 'fill'
-      ? await fillHdsRecords(order, { dryRun: opts.dryRun })
-      : await rewriteRenewalOrder(order, { dryRun: opts.dryRun });
-
-  if (action === 'fill') console.log('  action         : keeping the delivery date, adding the HDS records');
-  if (!out.ok) {
-    throw new Error(out.reason + (out.schedule ? ` (schedule from ${out.schedule.derivedFrom})` : ''));
-  }
-
-  if (out.schedule) console.log(
-    `  keeping        : ${out.schedule.deliveryDay || '?'} deliveries` +
-      ` (schedule ${out.schedule.scheduleId || 'n/a'}, from ${out.schedule.derivedFrom})` +
-      ` -> matched on ${out.resolved.matched_by}`
-  );
-  console.log('  new values     :');
-  for (const [k, v] of Object.entries(out.attributes)) console.log(`     ${k} = ${v}`);
-  const written = out.tags || (out.tag ? [out.tag] : []);
-  if (written.length) console.log(`     tags: ${written.join(', ')}`);
 
   if (opts.dryRun) {
     console.log('  [dry-run] nothing written');
@@ -168,8 +128,8 @@ async function runOne(orderId, opts) {
 
   console.log('  ✓ written to the Shopify order');
 
-  if (!opts.noRequeue && process.env.DATABASE_URL) {
-    const n = await requeue(orderId, out.resolved, out.attributes);
+  if (!opts.noRequeue && process.env.DATABASE_URL && out.resolved) {
+    const n = await requeue(orderId, out.resolved, out.wrote || {});
     console.log(n ? '  ✓ enrichment queue row reset to pending' : '  (no queue row for this order)');
   }
   return { written: true };
