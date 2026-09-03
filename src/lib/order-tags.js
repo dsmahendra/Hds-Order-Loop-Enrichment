@@ -43,6 +43,19 @@ function packDateTag(packDate) {
   return y && m && d ? `Pick-Pack-Date-${d}-${m}-${y}` : null;
 }
 
+// Does this order contain a subscription line?
+//
+// A FRESH order that creates a subscription has not been tagged by Loop yet at
+// webhook time, so classifying it by tags calls it a plain checkout order and the
+// subscription tags never get looked up. Shopify's own selling_plan_allocation is
+// on the line item from the moment the order exists, which is why the first order
+// on a subscription was ending up with only its two date tags.
+function hasSellingPlan(order) {
+  return (order?.line_items || []).some(
+    (li) => li?.selling_plan_allocation?.selling_plan || li?.selling_plan_allocation
+  );
+}
+
 // The two date tags, read off whatever dates the order already carries.
 function dateTags(order) {
   const delivery =
@@ -126,6 +139,7 @@ function taggingEnabled() {
 }
 
 module.exports = {
+  hasSellingPlan,
   deliveryDateTag,
   packDateTag,
   dateTags,

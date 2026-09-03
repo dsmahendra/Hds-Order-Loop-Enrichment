@@ -1,7 +1,13 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { tagsForOrder, missingTags, intervalPhrase, subscriptionTags } = require('../src/lib/order-tags');
+const {
+  tagsForOrder,
+  missingTags,
+  intervalPhrase,
+  subscriptionTags,
+  hasSellingPlan,
+} = require('../src/lib/order-tags');
 
 const attrs = (pairs) => ({
   note_attributes: Object.entries(pairs).map(([name, value]) => ({ name, value })),
@@ -108,4 +114,28 @@ test('a backfill omits the billing cycle rather than stamping today count on it'
 test('an absent count yields neither a cycle nor a first/recurring tag', () => {
   const tags = subscriptionTags({ subscriptionId: 'shopify-1' }, { atCreation: true });
   assert.deepStrictEqual(tags, ['Subscription', 'Subscription #1']);
+});
+
+// --- the first order on a subscription ---------------------------------------
+// Loop has not tagged it yet when the webhook fires, so it cannot be recognised
+// by tags. Shopify's selling_plan_allocation is present from the outset.
+
+test('a fresh subscription order is recognised by its selling plan', () => {
+  assert.strictEqual(
+    hasSellingPlan({ line_items: [{ selling_plan_allocation: { selling_plan: { id: 1 } } }] }),
+    true
+  );
+});
+
+test('a one-time purchase is not mistaken for a subscription', () => {
+  assert.strictEqual(hasSellingPlan({ line_items: [{ title: 'Biltong 3 Pack' }] }), false);
+  assert.strictEqual(hasSellingPlan({ line_items: [] }), false);
+  assert.strictEqual(hasSellingPlan({}), false);
+});
+
+test('one subscription line among one-time items still counts', () => {
+  const mixed = {
+    line_items: [{ title: 'gift card' }, { selling_plan_allocation: { selling_plan: { id: 2 } } }],
+  };
+  assert.strictEqual(hasSellingPlan(mixed), true);
 });
