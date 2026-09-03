@@ -9,17 +9,19 @@
 //   Subscription #71277740075               the Loop contract id
 //   Deliver every 1 WEEK                    Loop deliveryPolicy
 //   Pay every 1 WEEK                        Loop billingPolicy
-//   Billing cycle #3                        NOT derived — see below
+//   Billing cycle #3                        completedOrdersCount + 1, at creation
+//   Subscription First Order                completedOrdersCount === 0
 //   VIC_Mon_Thu_Sat                         NOT derived — see below
 //   Zapiet Delivery                         obsolete with Zapiet gone
 //   Imported By Robust NetSuite Integrator  NetSuite adds this itself
 //
-// Two are deliberately absent rather than guessed:
-//
-// Billing cycle #N — Loop reports completedOrdersCount as it is NOW, not as it was
-// when a given order was charged. Backfilling an old order would tag it with
-// today's count, which is worse than no tag. Loop's order payload would need to
-// carry the cycle number for this to be correct.
+// Billing cycle #N is correct only AT CREATION. Loop reports
+// completedOrdersCount as it is now, and at the moment an order is created that
+// count is the number of cycles BEFORE it — so this order is count + 1. Observed:
+// a first order carries "Billing cycle #1" with a count of 0, and an order with
+// two behind it carries "Billing cycle #3". Backfilling an old order would stamp
+// today's count on it, so atCreation gates it: the webhook passes true, order:fix
+// does not.
 //
 // VIC_Mon_Thu_Sat — the state is available, but Mon/Thu/Sat is not something HDS
 // publishes. VIC Melbourne Metro offers Mon, Thu, Fri, Sat and Sun, so this is a
@@ -69,7 +71,7 @@ function intervalPhrase(policy) {
 // context comes from subscriptionContextForOrder(); passing null simply yields no
 // subscription tags rather than failing, so an order Loop has not ingested yet
 // still gets its date tags.
-function subscriptionTags(context) {
+function subscriptionTags(context, { atCreation = false } = {}) {
   if (!context) return [];
 
   const tags = ['Subscription'];
@@ -79,7 +81,12 @@ function subscriptionTags(context) {
 
   // completedOrdersCount > 0 means at least one order has already shipped on this
   // subscription, so this one is a renewal rather than the first purchase.
-  if (Number(context.completedOrdersCount) > 0) tags.push('Subscription Recurring Order');
+  const completed = Number(context.completedOrdersCount);
+  if (Number.isFinite(completed)) {
+    tags.push(completed > 0 ? 'Subscription Recurring Order' : 'Subscription First Order');
+    // Only meaningful while the count still describes THIS order — see the note above.
+    if (atCreation) tags.push(`Billing cycle #${completed + 1}`);
+  }
 
   const delivery = intervalPhrase(context.deliveryPolicy);
   if (delivery) tags.push(`Deliver every ${delivery}`);
@@ -91,19 +98,19 @@ function subscriptionTags(context) {
 }
 
 // Everything the order should have, dates plus subscription.
-function tagsForOrder(order, context = null) {
-  return [...dateTags(order), ...subscriptionTags(context)];
+function tagsForOrder(order, context = null, opts = {}) {
+  return [...dateTags(order), ...subscriptionTags(context, opts)];
 }
 
 // Only the ones it does not already have. Compared case-insensitively, since
 // Shopify keeps the case a tag was first created with.
-function missingTags(order, context = null) {
+function missingTags(order, context = null, opts = {}) {
   const existing = String(order?.tags || '')
     .split(',')
     .map((t) => t.trim().toLowerCase())
     .filter(Boolean);
 
-  const wanted = tagsForOrder(order, context);
+  const wanted = tagsForOrder(order, context, opts);
   // Deduplicate within the wanted set too, in case two sources produce the same tag.
   const seen = new Set();
   return wanted.filter((t) => {
