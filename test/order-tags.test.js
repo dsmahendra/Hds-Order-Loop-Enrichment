@@ -237,3 +237,38 @@ test('unrecognised bound formats are rejected, not guessed at', () => {
     assert.strictEqual(parseLocalBound(bad), null, `${bad} should be rejected`);
   }
 });
+
+// --- setting one attribute and nothing else ----------------------------------
+// A bulk write across dozens of live orders must be provably narrow.
+
+test('adding the pack date leaves every other attribute exactly as it was', () => {
+  const existing = [
+    { name: '_amp_sc', value: 'W3sid...' },
+    { name: 'Delivery-Location-Id', value: '290879' },
+    { name: 'Delivery-Date', value: '2026/09/07' },
+    { name: 'Delivery-Time', value: '8:00 AM - 6:00 PM' },
+    { name: 'Delivery-Slot-Id', value: '132805668' },
+    { name: 'Custom-Attribute-1', value: 'METRO' },
+    { name: 'NetSuite Transaction Internal Id', value: '21321697' },
+  ];
+
+  const after = mergeNoteAttributes(existing, { 'Pick-Pack-Date': '2026/09/05' }, []);
+
+  // Every original attribute survives with its value intact...
+  for (const before of existing) {
+    const found = after.find((a) => a.name === before.name);
+    assert.ok(found, `${before.name} must survive`);
+    assert.strictEqual(found.value, before.value, `${before.name} must not change`);
+  }
+
+  // ...and exactly one thing is new.
+  const added = after.filter((a) => !existing.some((e) => e.name === a.name));
+  assert.deepStrictEqual(added, [{ name: 'Pick-Pack-Date', value: '2026/09/05' }]);
+});
+
+test('an empty tag list means the payload carries no tags at all', () => {
+  // updateOrderAttributes only sets payload.order.tags when there is something to
+  // add or remove, so with neither the order's tags are never sent — and therefore
+  // cannot be affected by a badly merged list.
+  assert.strictEqual(mergeTags('Subscription, QLD_Mon_Sat', [], []), 'Subscription, QLD_Mon_Sat');
+});
