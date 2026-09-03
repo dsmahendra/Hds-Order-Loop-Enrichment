@@ -153,14 +153,26 @@ router.post('/shopify/orders/create', async (req, res) => {
   let rewriteMatchedBy = null;
   let rewriteScheduleSource = null;
 
-  if (REWRITE_RENEWALS) {
-    const state = needsRewrite(order);
+  // REWRITE_RENEWAL_DATES=false means "do not REPLACE a date another system owns".
+  // It should never have meant "do not add one to an order that has none" — an
+  // order with no delivery date at all has nothing to protect, and refusing left it
+  // with no pack date either, which is the opposite of the intent.
+  const initialState = needsRewrite(order);
+  const noDeliveryDate =
+    !getNoteAttribute(order, 'Delivery-Date') && !getNoteAttribute(order, 'HDS Delivery Date');
+  const mayWriteDates = REWRITE_RENEWALS || noDeliveryDate;
+
+  if (mayWriteDates) {
+    const state = initialState;
     if (!state.stale) {
       if (source === 'loop') {
         console.log(`[webhook] order ${orderId}: ${state.reason} — no date rewrite needed`);
       }
     } else {
-      console.log(`[webhook] order ${orderId}: ${state.reason} — recomputing from the order date`);
+      console.log(
+        `[webhook] order ${orderId}: ${state.reason} — recomputing from the order date` +
+          (!REWRITE_RENEWALS ? ' (allowed with rewriting stood down: nothing is being replaced)' : '')
+      );
       previousDeliveryDate = state.current || null;
 
       // Best effort: the subscription's own Delivery-Date is the authoritative
