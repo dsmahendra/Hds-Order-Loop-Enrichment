@@ -139,19 +139,45 @@ async function main() {
     const base = (process.env.HDS_API_BASE || '').replace(/\/+$/, '');
     const url = `${base}/api/public/delivery-options?postcode=${encodeURIComponent(postcode)}&suburb=${encodeURIComponent(suburb)}`;
     const res = await fetch(url, { headers: { Accept: 'application/json' } });
-    const data = await res.json().catch(() => null);
-    const options = (data?.delivery_options || []).sort((a, b) => a.delivery_date.localeCompare(b.delivery_date));
-
-    console.log(`   region: ${data?.region?.name || '?'}  |  ${options.length} options`);
-    console.log('   earliest 6:');
-    for (const o of options.slice(0, 6)) {
-      const mark = schedule.deliveryDay && o.delivery_day.toLowerCase() === schedule.deliveryDay.toLowerCase() ? ' <- their weekday' : '';
-      console.log(`     ${o.delivery_date} ${o.delivery_day.padEnd(9)} pack ${o.pack_date}  sched ${String(o.schedule_id).padEnd(3)} cutoff ${o.cutoff_info}${mark}`);
+    const body = await res.text().catch(() => '');
+    let data = null;
+    try {
+      data = body ? JSON.parse(body) : null;
+    } catch {
+      // Non-JSON: the base URL is not the HDS API.
     }
-    if (schedule.deliveryDay) {
-      const match = options.find((o) => o.delivery_day.toLowerCase() === schedule.deliveryDay.toLowerCase());
-      console.log(`   first ${schedule.deliveryDay}: ${match ? `${match.delivery_date} (pack ${match.pack_date})` : 'NONE offered'}`);
-      console.log(`   earliest any day: ${options[0]?.delivery_date} ${options[0]?.delivery_day} (pack ${options[0]?.pack_date})`);
+
+    // Report the failure and carry on: sections 5 and 6 are still worth printing,
+    // and the queue row in 6 is often the most useful part when HDS is unreachable.
+    const options = !data
+      ? (console.log(`   HTTP ${res.status} and the body is not JSON — HDS_API_BASE is not the HDS API`),
+         console.log(`   base tried: ${base}`),
+         console.log(`   body      : ${body.replace(/\s+/g, ' ').slice(0, 120)}`),
+         [])
+      : data.success === false
+        ? (console.log(`   HTTP ${res.status}  ${data.error || data.message}`), [])
+        : (data.delivery_options || []).sort((a, b) => a.delivery_date.localeCompare(b.delivery_date));
+
+    // With no options there is nothing to list, and printing an empty table under
+    // an error reads as though HDS answered and had nothing — which is a different
+    // problem from not having reached HDS at all.
+    if (options.length) {
+      console.log(`   region: ${data?.region?.name || '?'}  |  ${options.length} options`);
+      console.log('   earliest 6:');
+      for (const o of options.slice(0, 6)) {
+        const mark =
+          schedule.deliveryDay && o.delivery_day.toLowerCase() === schedule.deliveryDay.toLowerCase()
+            ? ' <- their weekday'
+            : '';
+        console.log(
+          `     ${o.delivery_date} ${o.delivery_day.padEnd(9)} pack ${o.pack_date}  sched ${String(o.schedule_id).padEnd(3)} cutoff ${o.cutoff_info}${mark}`
+        );
+      }
+      if (schedule.deliveryDay) {
+        const match = options.find((o) => o.delivery_day.toLowerCase() === schedule.deliveryDay.toLowerCase());
+        console.log(`   first ${schedule.deliveryDay}: ${match ? `${match.delivery_date} (pack ${match.pack_date})` : 'NONE offered'}`);
+        console.log(`   earliest any day: ${options[0].delivery_date} ${options[0].delivery_day} (pack ${options[0].pack_date})`);
+      }
     }
   } else {
     console.log('   (cannot query HDS without both suburb and postcode)');

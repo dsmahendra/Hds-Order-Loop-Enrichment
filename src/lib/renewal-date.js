@@ -56,7 +56,17 @@ async function fetchDeliveryOptions({ postcode, suburb }) {
   }
 
   const data = await res.json().catch(() => null);
-  if (!data) return { ok: false, reason: `bad JSON (HTTP ${res.status})` };
+  if (!data) {
+    // A non-JSON body means we reached SOME server but not the HDS API — almost
+    // always a wrong HDS_API_BASE. Saying which base was used turns a blank
+    // "bad JSON" into something actionable.
+    return {
+      ok: false,
+      reason:
+        `HDS returned a non-JSON response (HTTP ${res.status}) from ${base()} — ` +
+        'check HDS_API_BASE points at the HDS delivery admin backend',
+    };
+  }
   if (data.success === false || data.serviceable === false) {
     return { ok: false, reason: data.error || 'not serviceable' };
   }
