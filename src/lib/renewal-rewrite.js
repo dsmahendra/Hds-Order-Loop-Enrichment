@@ -190,6 +190,22 @@ const DATE_TAG_SHAPE = /^d{2}-d{2}-d{4}$/;
 // still carries are visibly untrustworthy. Cleared the moment a rewrite succeeds.
 const HELD_TAG = 'HDS-Dates-Held';
 
+// Whether a rewrite may clear the date tags it supersedes.
+//
+// Off by default: tags on an order may be there for reasons we know nothing about,
+// and removing someone else's tag is not ours to do. So the write only ever ADDS.
+//
+// The cost of that, stated plainly: an order whose dates are rewritten keeps its
+// previous date tags alongside the new ones, so a fulfilment filter on
+// "Pick-Pack-Date-*" would match both. Set TAG_REMOVE_SUPERSEDED=true if that
+// matters more than leaving tags untouched.
+//
+// HDS-Dates-Held is exempt: it is a marker this service adds itself, and leaving it
+// on an order whose dates are now correct would mislabel it permanently.
+function mayRemoveSupersededTags() {
+  return String(process.env.TAG_REMOVE_SUPERSEDED || 'false').toLowerCase() === 'true';
+}
+
 // Renamed keys. The rewrite removes these so a stale value cannot sit alongside
 // its replacement, leaving downstream unable to tell which one is authoritative.
 const SUPERSEDED_ATTRIBUTES = ['HDS Pack Date'];
@@ -559,7 +575,10 @@ async function rewriteRenewalOrder(order, { dryRun = false, subscriptionAttribut
     attributes,
     addTags: tags,
     // Clear the held flag and any superseded date tag: these dates are now good.
-    removeTagPrefixes: [PACK_TAG_PREFIX, HELD_TAG, ...staleDateTags],
+    // Only ever our own held marker, unless removal is explicitly enabled.
+    removeTagPrefixes: mayRemoveSupersededTags()
+      ? [PACK_TAG_PREFIX, HELD_TAG, ...staleDateTags]
+      : [HELD_TAG],
     removeAttributes: SUPERSEDED_ATTRIBUTES,
     order,
   });
@@ -569,6 +588,7 @@ async function rewriteRenewalOrder(order, { dryRun = false, subscriptionAttribut
 
 module.exports = {
   needsRewrite,
+  mayRemoveSupersededTags,
   deliveryDateTag,
   locationCandidatesFor,
   HELD_TAG,

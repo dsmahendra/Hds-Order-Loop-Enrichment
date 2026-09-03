@@ -139,3 +139,54 @@ test('one subscription line among one-time items still counts', () => {
   };
   assert.strictEqual(hasSellingPlan(mixed), true);
 });
+
+// --- tags are never taken away -----------------------------------------------
+// Tags on an order may be there for reasons this service knows nothing about, so
+// a write only ever adds. The one exception is HDS-Dates-Held, which we set
+// ourselves and which would mislabel a corrected order if it stayed.
+
+const { mergeTags } = require('../src/shopify');
+const { mayRemoveSupersededTags } = require('../src/lib/renewal-rewrite');
+
+const EXISTING =
+  'Subscription, Billing cycle #20, QLD_Mon_Sat, Zapiet Delivery, ' +
+  'Pick-Pack-Date-24-07-2026, 26-07-2026, HDS-Dates-Held';
+
+test('every unrelated tag survives a write', () => {
+  const after = mergeTags(EXISTING, ['Pick-Pack-Date-05-09-2026', '07-09-2026'], ['HDS-Dates-Held']);
+
+  for (const kept of ['Subscription', 'Billing cycle #20', 'QLD_Mon_Sat', 'Zapiet Delivery']) {
+    assert.ok(after.includes(kept), `${kept} must survive`);
+  }
+});
+
+test('by default even superseded date tags are kept', () => {
+  const after = mergeTags(EXISTING, ['Pick-Pack-Date-05-09-2026'], ['HDS-Dates-Held']);
+
+  assert.ok(after.includes('Pick-Pack-Date-24-07-2026'), 'the old pack tag stays');
+  assert.ok(after.includes('Pick-Pack-Date-05-09-2026'), 'the new one is added');
+});
+
+test('the held marker is the one thing removed, being ours', () => {
+  const after = mergeTags(EXISTING, ['07-09-2026'], ['HDS-Dates-Held']);
+  assert.ok(!after.includes('HDS-Dates-Held'));
+});
+
+test('removal of superseded date tags is opt-in and off by default', () => {
+  const saved = process.env.TAG_REMOVE_SUPERSEDED;
+  try {
+    delete process.env.TAG_REMOVE_SUPERSEDED;
+    assert.strictEqual(mayRemoveSupersededTags(), false);
+
+    process.env.TAG_REMOVE_SUPERSEDED = 'true';
+    assert.strictEqual(mayRemoveSupersededTags(), true);
+  } finally {
+    if (saved === undefined) delete process.env.TAG_REMOVE_SUPERSEDED;
+    else process.env.TAG_REMOVE_SUPERSEDED = saved;
+  }
+});
+
+test('a tag already present is not duplicated', () => {
+  const after = mergeTags('07-09-2026, Subscription', ['07-09-2026', 'Subscription'], []);
+  assert.strictEqual(after, '07-09-2026, Subscription');
+});
