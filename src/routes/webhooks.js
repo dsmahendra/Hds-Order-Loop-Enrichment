@@ -21,7 +21,7 @@ const {
   fillHdsRecords,
   pendingHdsFields,
 } = require('../lib/renewal-rewrite');
-const { missingTags, taggingEnabled } = require('../lib/order-tags');
+const { missingTags, taggingEnabled, hasSellingPlan } = require('../lib/order-tags');
 const { buildHdsAttributes } = require('../lib/renewal-date');
 const { legacyLabelUpdates, describeUpdates, isEnabled: renameEnabled } = require('../lib/legacy-labels');
 const { updateOrderAttributes } = require('../shopify');
@@ -284,7 +284,9 @@ router.post('/shopify/orders/create', async (req, res) => {
     // subscription and we have not already read it, and a failure here costs only
     // those tags — the date ones come off the order itself.
     let tagContext = subscriptionContext;
-    if (!tagContext && (source === 'loop' || loopSubscriptionIdEarly)) {
+    // hasSellingPlan catches the FIRST order on a subscription, which Loop has not
+    // tagged yet when this fires — that order was getting only its date tags.
+    if (!tagContext && (source === 'loop' || hasSellingPlan(order) || loopSubscriptionIdEarly)) {
       try {
         tagContext = await subscriptionContextForOrder(orderId);
       } catch (err) {
