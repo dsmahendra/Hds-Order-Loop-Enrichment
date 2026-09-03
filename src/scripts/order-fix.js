@@ -132,7 +132,8 @@ async function runOne(orderId, opts) {
   );
   console.log('  new values     :');
   for (const [k, v] of Object.entries(out.attributes)) console.log(`     ${k} = ${v}`);
-  if (out.tag) console.log(`     tag: ${out.tag}`);
+  const written = out.tags || (out.tag ? [out.tag] : []);
+  if (written.length) console.log(`     tags: ${written.join(', ')}`);
 
   if (opts.dryRun) {
     console.log('  [dry-run] nothing written');
