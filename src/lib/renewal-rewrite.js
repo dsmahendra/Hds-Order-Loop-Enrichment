@@ -173,6 +173,19 @@ function packDateTag(packDate) {
 
 const PACK_TAG_PREFIX = 'Pick-Pack-Date-';
 
+// The delivery date as a bare DD-MM-YYYY tag — the convention already on the live
+// orders ("06-09-2026" for a 2026/09/06 delivery), which fulfilment filters on.
+function deliveryDateTag(deliveryDate) {
+  if (!deliveryDate) return null;
+  const [y, m, d] = String(deliveryDate).slice(0, 10).split('-');
+  if (!y || !m || !d) return null;
+  return `${d}-${m}-${y}`;
+}
+
+// A bare date tag has no prefix to match on, so a superseded one is removed by
+// computing its exact text from the date the order previously carried.
+const DATE_TAG_SHAPE = /^d{2}-d{2}-d{4}$/;
+
 // Tagged onto an order whose dates could NOT be recomputed, so the expired ones it
 // still carries are visibly untrustworthy. Cleared the moment a rewrite succeeds.
 const HELD_TAG = 'HDS-Dates-Held';
@@ -525,23 +538,38 @@ async function rewriteRenewalOrder(order, { dryRun = false, subscriptionAttribut
     preferredWindow: getNoteAttribute(order, 'HDS Delivery Window'),
   });
   const tag = packDateTag(resolved.pack_date);
+  const dateTag = deliveryDateTag(resolved.delivery_date);
+  const tags = [tag, dateTag].filter(Boolean);
 
-  if (dryRun) return { ok: true, dryRun: true, resolved, attributes, tag, orderDate, schedule, usedFallback, locationUsed };
+  // The date the order arrived with, so its tag is cleared rather than left
+  // sitting beside the new one.
+  const previousRaw =
+    getNoteAttribute(order, 'Delivery-Date') || getNoteAttribute(order, 'HDS Delivery Date');
+  const previousDateTag = previousRaw ? deliveryDateTag(normalizeDate(previousRaw)) : null;
+  const staleDateTags =
+    previousDateTag && previousDateTag !== dateTag && DATE_TAG_SHAPE.test(previousDateTag)
+      ? [previousDateTag]
+      : [];
+
+  if (dryRun) {
+    return { ok: true, dryRun: true, resolved, attributes, tag, tags, orderDate, schedule, usedFallback, locationUsed };
+  }
 
   await updateOrderAttributes(orderId, {
     attributes,
-    addTags: tag ? [tag] : [],
-    // Clear the held flag: these dates are now good.
-    removeTagPrefixes: [PACK_TAG_PREFIX, HELD_TAG],
+    addTags: tags,
+    // Clear the held flag and any superseded date tag: these dates are now good.
+    removeTagPrefixes: [PACK_TAG_PREFIX, HELD_TAG, ...staleDateTags],
     removeAttributes: SUPERSEDED_ATTRIBUTES,
     order,
   });
 
-  return { ok: true, resolved, attributes, tag, orderDate, schedule, usedFallback, locationUsed };
+  return { ok: true, resolved, attributes, tag, tags, orderDate, schedule, usedFallback, locationUsed };
 }
 
 module.exports = {
   needsRewrite,
+  deliveryDateTag,
   locationCandidatesFor,
   HELD_TAG,
   selectionMode,
@@ -690,20 +718,22 @@ async function fillHdsRecords(order, { dryRun = false } = {}) {
     }
 
     const tag = packDateTag(resolved.pack_date);
+    const dateTag = deliveryDateTag(resolved.delivery_date);
+    const tags = [tag, dateTag].filter(Boolean);
 
-    if (dryRun) return { ok: true, dryRun: true, resolved, attributes, tag, locationUsed: candidate, scope };
+    if (dryRun) return { ok: true, dryRun: true, resolved, attributes, tag, tags, locationUsed: candidate, scope };
 
     await updateOrderAttributes(orderId, {
       attributes,
-      addTags: tag ? [tag] : [],
-      // Additive: no tag stripped, no renamed key removed. This path adds what is
-      // missing; it does not tidy what is already there.
+      addTags: tags,
+      // Additive: nothing stripped. A tag the order already carries is
+      // deduplicated by mergeTags rather than repeated.
       removeTagPrefixes: [],
       removeAttributes: [],
       order,
     });
 
-    return { ok: true, resolved, attributes, tag, locationUsed: candidate, scope };
+    return { ok: true, resolved, attributes, tag, tags, locationUsed: candidate, scope };
   }
 
   return { ok: false, reason: attempts.join('; ') || 'no serviceable address on the order' };

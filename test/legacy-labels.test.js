@@ -69,3 +69,25 @@ test('the rename can be switched off without a deploy', () => {
     else process.env.RENAME_LEGACY_LABELS = saved;
   }
 });
+
+// --- order tags --------------------------------------------------------------
+// Both dates go on as tags, in the conventions already present on live orders:
+// the delivery date bare ("06-09-2026") and the pack date prefixed.
+
+const { deliveryDateTag, packDateTag } = require('../src/lib/renewal-rewrite');
+
+test('the delivery date becomes a bare DD-MM-YYYY tag', () => {
+  assert.strictEqual(deliveryDateTag('2026-09-11'), '11-09-2026');
+  assert.strictEqual(deliveryDateTag('2026-09-06'), '06-09-2026');
+});
+
+test('the pack date keeps its prefix, so the two tags cannot be confused', () => {
+  assert.strictEqual(packDateTag('2026-09-09'), 'Pick-Pack-Date-09-09-2026');
+});
+
+test('a missing or unparseable date yields no tag rather than a broken one', () => {
+  for (const bad of [null, undefined, '', 'not a date']) {
+    assert.strictEqual(deliveryDateTag(bad), null);
+    assert.strictEqual(packDateTag(bad), null);
+  }
+});
