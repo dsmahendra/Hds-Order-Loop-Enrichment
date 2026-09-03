@@ -21,7 +21,8 @@
 //   --dry-run       report only
 //   --overwrite     replace an existing Pick-Pack-Date
 //   --since <date>  bound the scan (ISO). Defaults to 60 days back.
-//   --no-tag        do not add the Pick-Pack-Date-DD-MM-YYYY tag
+//   --with-tags     also add the date tags. Off by default: this command sets the
+//                   pack date and nothing else, so tags are left exactly as they are.
 
 require('dotenv').config();
 const { listOrders, getNoteAttribute, updateOrderAttributes, normalizeDate } = require('../shopify');
@@ -41,7 +42,7 @@ function parseArgs(argv) {
     else if (a === '--since') opts.since = argv[++i];
     else if (a === '--dry-run') opts.dryRun = true;
     else if (a === '--overwrite') opts.overwrite = true;
-    else if (a === '--no-tag') opts.noTag = true;
+    else if (a === '--with-tags') opts.withTags = true;
     else if (a === '--created-from') opts.createdFrom = argv[++i];
     else if (a === '--created-to') opts.createdTo = argv[++i];
     else throw new Error(`unknown flag ${a}`);
@@ -124,6 +125,7 @@ async function main() {
   console.log('pack date:', packSlash, tag ? `(tag ${tag})` : '');
   console.log('mode     :', opts.dryRun ? 'DRY RUN (nothing written)' : 'writing');
   console.log('existing :', opts.overwrite ? 'WILL BE REPLACED' : 'left alone');
+  console.log('changes  : Pick-Pack-Date only' + (opts.withTags ? ' + date tags' : ' — no tags, no other attribute'));
   console.log('scanning since:', since, '\n');
 
   let pageInfo = null;
@@ -182,13 +184,18 @@ async function main() {
       continue;
     }
 
+    // Exactly one attribute. mergeNoteAttributes merges rather than replaces, so
+    // every other attribute on the order is carried through untouched, and with no
+    // tags to add the payload omits the tags field entirely — Shopify is not sent
+    // a tag list at all, so nothing there can be affected.
     const attributes = { 'Pick-Pack-Date': packSlash };
     const addTags = [];
-    if (!opts.noTag && tag) addTags.push(tag);
-    // Add the delivery-date tag too if the order has a date and no tag for it.
-    if (!opts.noTag && deliveryIso) {
-      const dTag = deliveryDateTag(deliveryIso);
-      if (dTag) addTags.push(dTag);
+    if (opts.withTags) {
+      if (tag) addTags.push(tag);
+      if (deliveryIso) {
+        const dTag = deliveryDateTag(deliveryIso);
+        if (dTag) addTags.push(dTag);
+      }
     }
 
     const note = wrongWayRound ? '   ** pack is not before delivery **' : '';
