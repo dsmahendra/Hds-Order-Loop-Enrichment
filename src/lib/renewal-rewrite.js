@@ -743,3 +743,61 @@ module.exports.hasHdsRecords = hasHdsRecords;
 module.exports.additiveOnly = additiveOnly;
 module.exports.fillScope = fillScope;
 module.exports.fillHdsRecords = fillHdsRecords;
+
+// ---------------------------------------------------------------------------
+// Making sure every order carries its two date tags.
+//
+// The rewrite and the fill both tag what they write, but an order that arrived
+// already complete - a normal checkout order, where the extension has written the
+// whole HDS set - triggers neither, and so got no tags at all. Arigato and Zapiet
+// used to tag those, and nothing replaced it.
+//
+// This needs no HDS call: the dates are already on the order, so the tags are
+// derived from them directly. Purely additive - an existing tag is left alone.
+function dateTagsForOrder(order) {
+  const deliveryRaw =
+    getNoteAttribute(order, 'Delivery-Date') || getNoteAttribute(order, 'HDS Delivery Date');
+  const packRaw =
+    getNoteAttribute(order, 'Pick-Pack-Date') ||
+    getNoteAttribute(order, 'HDS Ship Date') ||
+    getNoteAttribute(order, 'HDS Pack Date');
+
+  return [
+    deliveryRaw ? deliveryDateTag(normalizeDate(deliveryRaw)) : null,
+    packRaw ? packDateTag(normalizeDate(packRaw)) : null,
+  ].filter(Boolean);
+}
+
+// Which of those the order does not already have. Compared case-insensitively,
+// since Shopify preserves the case a tag was created with.
+function missingDateTags(order) {
+  const existing = String(order?.tags || '')
+    .split(',')
+    .map((t) => t.trim().toLowerCase())
+    .filter(Boolean);
+
+  return dateTagsForOrder(order).filter((t) => !existing.includes(t.toLowerCase()));
+}
+
+function taggingEnabled() {
+  return String(process.env.TAG_ORDER_DATES || 'true').toLowerCase() !== 'false';
+}
+
+// Add whatever is missing, and nothing else.
+async function ensureDateTags(order, { dryRun = false } = {}) {
+  const orderId = order?.id;
+  if (!orderId) return { ok: false, reason: 'order payload has no id' };
+
+  const missing = missingDateTags(order);
+  if (!missing.length) return { ok: false, reason: 'both date tags are already on the order' };
+
+  if (dryRun) return { ok: true, dryRun: true, added: missing };
+
+  await updateOrderAttributes(orderId, { addTags: missing, order });
+  return { ok: true, added: missing };
+}
+
+module.exports.dateTagsForOrder = dateTagsForOrder;
+module.exports.missingDateTags = missingDateTags;
+module.exports.taggingEnabled = taggingEnabled;
+module.exports.ensureDateTags = ensureDateTags;
