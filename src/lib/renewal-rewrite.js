@@ -687,7 +687,10 @@ function hasHdsRecords(order) {
   );
 }
 
-async function fillHdsRecords(order, { dryRun = false } = {}) {
+// overwrite: replace values already on the order rather than only adding missing
+// ones. For correcting a set that was written wrongly — a pack date typed by hand,
+// say — where the existing values are the problem rather than something to protect.
+async function fillHdsRecords(order, { dryRun = false, overwrite = false } = {}) {
   const orderId = order?.id;
   if (!orderId) return { ok: false, reason: 'order payload has no id' };
 
@@ -751,7 +754,7 @@ async function fillHdsRecords(order, { dryRun = false } = {}) {
     });
 
     const scope = fillScope();
-    let attributes = additiveOnly(order, built);
+    let attributes = overwrite ? built : additiveOnly(order, built);
 
     if (scope === 'pack-date') {
       // Just the one key NetSuite reads. Everything else the order already had

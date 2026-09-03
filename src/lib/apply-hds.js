@@ -65,13 +65,23 @@ function planFor(order) {
 }
 
 // Apply it. Returns what was done so callers can report consistently.
-async function applyHdsToOrder(order, { dryRun = false, atCreation = false, force = false } = {}) {
+// recompute: derive the HDS values again and REPLACE what is on the order, for
+// correcting a set that was written wrongly. Only meaningful where the order has a
+// delivery date to compute around; without one the rewrite path handles it anyway.
+async function applyHdsToOrder(
+  order,
+  { dryRun = false, atCreation = false, force = false, recompute = false } = {}
+) {
   const orderId = order?.id;
   if (!orderId) return { ok: false, action: 'none', reason: 'order payload has no id' };
 
-  const plan = force && hasDeliveryDate(order) && rewriteEnabled()
-    ? { action: 'rewrite', reason: 'forced' }
-    : planFor(order);
+  let plan = planFor(order);
+  if (force && hasDeliveryDate(order) && rewriteEnabled()) {
+    plan = { action: 'rewrite', reason: 'forced' };
+  } else if (recompute && hasDeliveryDate(order)) {
+    // Keep the delivery date, replace everything derived from it.
+    plan = { action: 'fill', reason: 'recomputing the HDS values around the existing delivery date' };
+  }
 
   const result = { action: plan.action, reason: plan.reason, wrote: null, tagsAdded: [] };
 
@@ -85,7 +95,7 @@ async function applyHdsToOrder(order, { dryRun = false, atCreation = false, forc
     result.resolved = out.resolved;
     result.tagsAdded = out.tags || [];
   } else if (plan.action === 'fill') {
-    const out = await fillHdsRecords(order, { dryRun });
+    const out = await fillHdsRecords(order, { dryRun, overwrite: recompute });
     if (!out.ok) return { ...result, ok: false, reason: out.reason };
     result.wrote = out.attributes;
     result.resolved = out.resolved;
