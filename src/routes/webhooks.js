@@ -19,10 +19,9 @@ const {
   HELD_TAG,
   hasHdsRecords,
   fillHdsRecords,
-  ensureDateTags,
-  taggingEnabled,
-  missingDateTags,
+  pendingHdsFields,
 } = require('../lib/renewal-rewrite');
+const { missingTags, taggingEnabled } = require('../lib/order-tags');
 const { buildHdsAttributes } = require('../lib/renewal-date');
 const { legacyLabelUpdates, describeUpdates, isEnabled: renameEnabled } = require('../lib/legacy-labels');
 const { updateOrderAttributes } = require('../shopify');
@@ -147,6 +146,7 @@ router.post('/shopify/orders/create', async (req, res) => {
   let rewriteFailed = false;
   let filled = false;
   let loopSubscriptionIdEarly = null;
+  let subscriptionContext = null;
   // Recorded so a questioned date can be explained later: what the order arrived
   // with, and what the resolver locked onto.
   let previousDeliveryDate = null;
@@ -169,6 +169,7 @@ router.post('/shopify/orders/create', async (req, res) => {
       let subscriptionAttributes = null;
       try {
         const context = await subscriptionContextForOrder(orderId);
+        subscriptionContext = context;
         subscriptionAttributes = context?.attributes || null;
         if (context) loopSubscriptionIdEarly = context.subscriptionId;
       } catch (err) {
@@ -228,14 +229,17 @@ router.post('/shopify/orders/create', async (req, res) => {
   //
   // Never fills around a STALE date: deriving a pack date from an expired delivery
   // date would hand the kitchen something already in the past.
-  if (FILL_HDS && !rewritten && !rewriteFailed && !hasHdsRecords(order)) {
+  const pending = FILL_HDS ? pendingHdsFields(order) : [];
+  if (pending.length && !rewritten && !rewriteFailed) {
     const stale = needsRewrite(order).stale;
     if (stale) {
       console.log(
         `[webhook] order ${orderId}: no HDS records, but its delivery date is expired — not deriving from it`
       );
     } else {
-      console.log(`[webhook] order ${orderId}: has a delivery date but no HDS records — filling them in`);
+      console.log(
+        `[webhook] order ${orderId}: missing ${pending.length} HDS field(s) — ${pending.join(', ')}`
+      );
       try {
         const filled = await fillHdsRecords(order);
         if (!filled.ok) {
@@ -268,14 +272,28 @@ router.post('/shopify/orders/create', async (req, res) => {
   // fill, and so was getting no tags at all. Arigato and Zapiet used to tag those
   // and nothing replaced them. No HDS call needed: the dates are already on the
   // order, so the tags come straight off them.
-  if (taggingEnabled() && !rewritten && !filled) {
-    const missing = missingDateTags(order);
+  if (taggingEnabled()) {
+    // Loop supplies the subscription tags. Fetched only when the order looks like a
+    // subscription and we have not already read it, and a failure here costs only
+    // those tags — the date ones come off the order itself.
+    let tagContext = subscriptionContext;
+    if (!tagContext && (source === 'loop' || loopSubscriptionIdEarly)) {
+      try {
+        tagContext = await subscriptionContextForOrder(orderId);
+      } catch (err) {
+        console.warn(
+          `[webhook] order ${orderId}: no subscription tags — ${describeError(err)}`
+        );
+      }
+    }
+
+    const missing = missingTags(order, tagContext);
     if (missing.length) {
       try {
-        await ensureDateTags(order);
+        await updateOrderAttributes(orderId, { addTags: missing, order });
         console.log(`[webhook] order ${orderId}: tags added — ${missing.join(', ')}`);
       } catch (err) {
-        console.warn(`[webhook] order ${orderId}: could not add date tags — ${describeError(err)}`);
+        console.warn(`[webhook] order ${orderId}: could not add tags — ${describeError(err)}`);
       }
     }
   }

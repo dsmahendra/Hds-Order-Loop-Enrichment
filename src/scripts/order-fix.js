@@ -26,9 +26,10 @@ const {
   locationFor,
   hasHdsRecords,
   fillHdsRecords,
-  ensureDateTags,
-  missingDateTags,
 } = require('../lib/renewal-rewrite');
+const { missingTags } = require('../lib/order-tags');
+const { subscriptionContextForOrder } = require('../loop');
+const { updateOrderAttributes } = require('../shopify');
 const { buildHdsAttributes } = require('../lib/renewal-date');
 
 function parseArgs(argv) {
@@ -114,15 +115,23 @@ async function runOne(orderId, opts) {
   if (action === 'skip') {
     // The dates are all present, but the tags may still be absent — which is the
     // normal state of a checkout order now that nothing else tags them.
-    const missing = missingDateTags(order);
+    // Loop supplies the subscription tags; without it only the date tags are added.
+    let context = null;
+    try {
+      context = await subscriptionContextForOrder(orderId);
+    } catch {
+      // Not a subscription, or Loop has not ingested it — date tags still apply.
+    }
+
+    const missing = missingTags(order, context);
     if (missing.length) {
-      console.log(`  action         : dates are complete; adding the missing tags`);
+      console.log('  action         : dates are complete; adding the missing tags');
       console.log(`  tags to add    : ${missing.join(', ')}`);
       if (opts.dryRun) {
         console.log('  [dry-run] nothing written');
         return { dryRun: true };
       }
-      await ensureDateTags(order);
+      await updateOrderAttributes(orderId, { addTags: missing, order });
       console.log('  ✓ tags written to the Shopify order');
       return { written: true };
     }

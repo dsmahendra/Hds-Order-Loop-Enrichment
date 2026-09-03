@@ -17,6 +17,8 @@ const {
   hasHdsRecords,
   additiveOnly,
   fillScope,
+  HDS_FIELDS,
+  pendingHdsFields,
 } = require('../src/lib/renewal-rewrite');
 const { mergeNoteAttributes, mergeTags } = require('../src/shopify');
 
@@ -307,22 +309,33 @@ test('an order with nothing on it takes everything offered', () => {
   assert.strictEqual(Object.keys(kept).length, 2);
 });
 
-test('the fill scope defaults to the pack date alone', () => {
+test('the fill scope defaults to every missing HDS field', () => {
   const saved = process.env.FILL_HDS_ATTRIBUTES;
   try {
+    // Adding every missing field is safe because the write is additive — nothing
+    // already on the order is replaced — so the default is the fuller one.
     delete process.env.FILL_HDS_ATTRIBUTES;
-    assert.strictEqual(fillScope(), 'pack-date');
-
-    process.env.FILL_HDS_ATTRIBUTES = 'all-missing';
     assert.strictEqual(fillScope(), 'all-missing');
 
-    // Anything unrecognised stays on the cautious setting.
-    process.env.FILL_HDS_ATTRIBUTES = 'everything';
+    process.env.FILL_HDS_ATTRIBUTES = 'pack-date';
     assert.strictEqual(fillScope(), 'pack-date');
+
+    process.env.FILL_HDS_ATTRIBUTES = 'everything';
+    assert.strictEqual(fillScope(), 'all-missing');
   } finally {
     if (saved === undefined) delete process.env.FILL_HDS_ATTRIBUTES;
     else process.env.FILL_HDS_ATTRIBUTES = saved;
   }
+});
+
+test('a complete order needs no HDS lookup, an incomplete one names what it needs', () => {
+  const complete = {};
+  for (const f of HDS_FIELDS) complete[f] = 'x';
+
+  assert.strictEqual(pendingHdsFields(attrs(complete)).length, 0, 'nothing pending');
+
+  const { 'HDS Region': _region, 'Charge Offset': _offset, ...partial } = complete;
+  assert.deepStrictEqual(pendingHdsFields(attrs(partial)), ['Charge Offset', 'HDS Region']);
 });
 
 // --- the key NetSuite reads --------------------------------------------------

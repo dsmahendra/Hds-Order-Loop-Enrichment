@@ -1,0 +1,130 @@
+// The tags an order should carry, now that Arigato and Zapiet no longer add them.
+//
+// Taken from the live orders before the cutover:
+//
+//   06-09-2026                              delivery date        <- derived here
+//   Pick-Pack-Date-22-08-2026               pack date            <- derived here
+//   Subscription                            it is a subscription <- derived here
+//   Subscription Recurring Order            a renewal, not the first order
+//   Subscription #71277740075               the Loop contract id
+//   Deliver every 1 WEEK                    Loop deliveryPolicy
+//   Pay every 1 WEEK                        Loop billingPolicy
+//   Billing cycle #3                        NOT derived — see below
+//   VIC_Mon_Thu_Sat                         NOT derived — see below
+//   Zapiet Delivery                         obsolete with Zapiet gone
+//   Imported By Robust NetSuite Integrator  NetSuite adds this itself
+//
+// Two are deliberately absent rather than guessed:
+//
+// Billing cycle #N — Loop reports completedOrdersCount as it is NOW, not as it was
+// when a given order was charged. Backfilling an old order would tag it with
+// today's count, which is worse than no tag. Loop's order payload would need to
+// carry the cycle number for this to be correct.
+//
+// VIC_Mon_Thu_Sat — the state is available, but Mon/Thu/Sat is not something HDS
+// publishes. VIC Melbourne Metro offers Mon, Thu, Fri, Sat and Sun, so this is a
+// narrower per-customer or per-plan pattern held somewhere we cannot see. Inventing
+// it from the offered days would produce a different tag than fulfilment expects.
+
+const { getNoteAttribute, normalizeDate } = require('../shopify');
+
+// ISO 2026-09-06 -> "06-09-2026", the bare form already on the live orders.
+function deliveryDateTag(deliveryDate) {
+  if (!deliveryDate) return null;
+  const [y, m, d] = String(deliveryDate).slice(0, 10).split('-');
+  return y && m && d ? `${d}-${m}-${y}` : null;
+}
+
+function packDateTag(packDate) {
+  if (!packDate) return null;
+  const [y, m, d] = String(packDate).slice(0, 10).split('-');
+  return y && m && d ? `Pick-Pack-Date-${d}-${m}-${y}` : null;
+}
+
+// The two date tags, read off whatever dates the order already carries.
+function dateTags(order) {
+  const delivery =
+    getNoteAttribute(order, 'Delivery-Date') || getNoteAttribute(order, 'HDS Delivery Date');
+  const pack =
+    getNoteAttribute(order, 'Pick-Pack-Date') ||
+    getNoteAttribute(order, 'HDS Ship Date') ||
+    getNoteAttribute(order, 'HDS Pack Date');
+
+  return [
+    delivery ? deliveryDateTag(normalizeDate(delivery)) : null,
+    pack ? packDateTag(normalizeDate(pack)) : null,
+  ].filter(Boolean);
+}
+
+// "WEEK" + 1 -> "1 WEEK"; "WEEK" + 2 -> "2 WEEK", matching the observed casing.
+function intervalPhrase(policy) {
+  const interval = policy?.interval;
+  const count = policy?.intervalCount;
+  if (!interval || !Number.isFinite(Number(count))) return null;
+  return `${Number(count)} ${String(interval).toUpperCase()}`;
+}
+
+// What the Loop subscription tells us about the order.
+//
+// context comes from subscriptionContextForOrder(); passing null simply yields no
+// subscription tags rather than failing, so an order Loop has not ingested yet
+// still gets its date tags.
+function subscriptionTags(context) {
+  if (!context) return [];
+
+  const tags = ['Subscription'];
+
+  const id = String(context.subscriptionId || '').replace(/^shopify-/, '');
+  if (id) tags.push(`Subscription #${id}`);
+
+  // completedOrdersCount > 0 means at least one order has already shipped on this
+  // subscription, so this one is a renewal rather than the first purchase.
+  if (Number(context.completedOrdersCount) > 0) tags.push('Subscription Recurring Order');
+
+  const delivery = intervalPhrase(context.deliveryPolicy);
+  if (delivery) tags.push(`Deliver every ${delivery}`);
+
+  const billing = intervalPhrase(context.billingPolicy);
+  if (billing) tags.push(`Pay every ${billing}`);
+
+  return tags;
+}
+
+// Everything the order should have, dates plus subscription.
+function tagsForOrder(order, context = null) {
+  return [...dateTags(order), ...subscriptionTags(context)];
+}
+
+// Only the ones it does not already have. Compared case-insensitively, since
+// Shopify keeps the case a tag was first created with.
+function missingTags(order, context = null) {
+  const existing = String(order?.tags || '')
+    .split(',')
+    .map((t) => t.trim().toLowerCase())
+    .filter(Boolean);
+
+  const wanted = tagsForOrder(order, context);
+  // Deduplicate within the wanted set too, in case two sources produce the same tag.
+  const seen = new Set();
+  return wanted.filter((t) => {
+    const key = t.toLowerCase();
+    if (existing.includes(key) || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function taggingEnabled() {
+  return String(process.env.TAG_ORDER_DATES || 'true').toLowerCase() !== 'false';
+}
+
+module.exports = {
+  deliveryDateTag,
+  packDateTag,
+  dateTags,
+  subscriptionTags,
+  intervalPhrase,
+  tagsForOrder,
+  missingTags,
+  taggingEnabled,
+};

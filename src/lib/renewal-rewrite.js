@@ -609,9 +609,43 @@ module.exports = {
 // Either way the write is ADDITIVE: a value the order already carries is never
 // replaced, so nothing here can change a date a customer was already told.
 function fillScope() {
-  return String(process.env.FILL_HDS_ATTRIBUTES || 'pack-date').toLowerCase() === 'all-missing'
-    ? 'all-missing'
-    : 'pack-date';
+  return String(process.env.FILL_HDS_ATTRIBUTES || 'all-missing').toLowerCase() === 'pack-date'
+    ? 'pack-date'
+    : 'all-missing';
+}
+
+// Every field the HDS set contributes to an order. Delivery-Date and Delivery-Time
+// are absent on purpose: those belong to whatever scheduled the order.
+const HDS_FIELDS = [
+  'Pick-Pack-Date',
+  'HDS Delivery Date',
+  'HDS Delivery Formatted',
+  'HDS Delivery Day',
+  'HDS Delivery Window',
+  'HDS Schedule ID',
+  'HDS Cutoff Day',
+  'HDS Cutoff Date',
+  'Charge Offset',
+  'HDS Ship Date',
+  'HDS Production Date',
+  'HDS Region',
+  'HDS Suburb',
+  'HDS Postcode',
+];
+
+function missingHdsFields(order) {
+  return HDS_FIELDS.filter((f) => {
+    const v = getNoteAttribute(order, f);
+    return v === null || v === undefined || v === '';
+  });
+}
+
+// What the current scope would actually add. Used to decide whether an HDS lookup
+// is worth making at all: an order missing nothing needs no call, and in pack-date
+// scope an order missing only HDS Region needs no call either.
+function pendingHdsFields(order) {
+  const missing = missingHdsFields(order);
+  return fillScope() === 'pack-date' ? missing.filter((f) => f === 'Pick-Pack-Date') : missing;
 }
 
 // Drop anything the order already has a value for, so the write can only add.
@@ -740,64 +774,12 @@ async function fillHdsRecords(order, { dryRun = false } = {}) {
 }
 
 module.exports.hasHdsRecords = hasHdsRecords;
+module.exports.HDS_FIELDS = HDS_FIELDS;
+module.exports.missingHdsFields = missingHdsFields;
+module.exports.pendingHdsFields = pendingHdsFields;
 module.exports.additiveOnly = additiveOnly;
 module.exports.fillScope = fillScope;
 module.exports.fillHdsRecords = fillHdsRecords;
 
-// ---------------------------------------------------------------------------
-// Making sure every order carries its two date tags.
-//
-// The rewrite and the fill both tag what they write, but an order that arrived
-// already complete - a normal checkout order, where the extension has written the
-// whole HDS set - triggers neither, and so got no tags at all. Arigato and Zapiet
-// used to tag those, and nothing replaced it.
-//
-// This needs no HDS call: the dates are already on the order, so the tags are
-// derived from them directly. Purely additive - an existing tag is left alone.
-function dateTagsForOrder(order) {
-  const deliveryRaw =
-    getNoteAttribute(order, 'Delivery-Date') || getNoteAttribute(order, 'HDS Delivery Date');
-  const packRaw =
-    getNoteAttribute(order, 'Pick-Pack-Date') ||
-    getNoteAttribute(order, 'HDS Ship Date') ||
-    getNoteAttribute(order, 'HDS Pack Date');
-
-  return [
-    deliveryRaw ? deliveryDateTag(normalizeDate(deliveryRaw)) : null,
-    packRaw ? packDateTag(normalizeDate(packRaw)) : null,
-  ].filter(Boolean);
-}
-
-// Which of those the order does not already have. Compared case-insensitively,
-// since Shopify preserves the case a tag was created with.
-function missingDateTags(order) {
-  const existing = String(order?.tags || '')
-    .split(',')
-    .map((t) => t.trim().toLowerCase())
-    .filter(Boolean);
-
-  return dateTagsForOrder(order).filter((t) => !existing.includes(t.toLowerCase()));
-}
-
-function taggingEnabled() {
-  return String(process.env.TAG_ORDER_DATES || 'true').toLowerCase() !== 'false';
-}
-
-// Add whatever is missing, and nothing else.
-async function ensureDateTags(order, { dryRun = false } = {}) {
-  const orderId = order?.id;
-  if (!orderId) return { ok: false, reason: 'order payload has no id' };
-
-  const missing = missingDateTags(order);
-  if (!missing.length) return { ok: false, reason: 'both date tags are already on the order' };
-
-  if (dryRun) return { ok: true, dryRun: true, added: missing };
-
-  await updateOrderAttributes(orderId, { addTags: missing, order });
-  return { ok: true, added: missing };
-}
-
-module.exports.dateTagsForOrder = dateTagsForOrder;
-module.exports.missingDateTags = missingDateTags;
-module.exports.taggingEnabled = taggingEnabled;
-module.exports.ensureDateTags = ensureDateTags;
+// Tags live in ./order-tags.js — a single implementation, so the webhook and the
+// CLI cannot drift apart on what an order should be tagged with.
