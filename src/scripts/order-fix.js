@@ -19,6 +19,7 @@
 
 require('dotenv').config();
 const { getOrder, getNoteAttribute, describeAdminToken } = require('../shopify');
+const { resolveAdminToken } = require('../shopify-tokens');
 const {
   needsRewrite,
   rewriteRenewalOrder,
@@ -158,7 +159,11 @@ async function main() {
   // Print the config before doing anything: a missing variable is by far the most
   // common reason this script cannot run, and it is cheaper to see than to infer.
   console.log('SHOPIFY_STORE       :', process.env.SHOPIFY_STORE || 'MISSING');
-  console.log('SHOPIFY_ADMIN_TOKEN :', describeAdminToken(process.env.SHOPIFY_ADMIN_TOKEN));
+  const resolved = process.env.SHOPIFY_STORE
+    ? await resolveAdminToken(process.env.SHOPIFY_STORE)
+    : { token: null, source: 'none' };
+  console.log('token source        :', resolved.source);
+  console.log('token               :', describeAdminToken(resolved.token));
   console.log('HDS_API_BASE        :', process.env.HDS_API_BASE || 'MISSING');
   console.log('DATABASE_URL        :', process.env.DATABASE_URL ? 'set (queue row will be reset)' : 'not set (Shopify only)');
 
