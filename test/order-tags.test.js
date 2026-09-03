@@ -145,7 +145,7 @@ test('one subscription line among one-time items still counts', () => {
 // a write only ever adds. The one exception is HDS-Dates-Held, which we set
 // ourselves and which would mislabel a corrected order if it stayed.
 
-const { mergeTags } = require('../src/shopify');
+const { mergeTags, mergeNoteAttributes } = require('../src/shopify');
 const { mayRemoveSupersededTags } = require('../src/lib/renewal-rewrite');
 
 const EXISTING =
