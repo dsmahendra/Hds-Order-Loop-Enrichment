@@ -190,3 +190,50 @@ test('a tag already present is not duplicated', () => {
   const after = mergeTags('07-09-2026, Subscription', ['07-09-2026', 'Subscription'], []);
   assert.strictEqual(after, '07-09-2026, Subscription');
 });
+
+// --- selecting orders by when they were placed -------------------------------
+// Shopify's created_at carries the store offset, so the local part IS store time
+// and needs no conversion. The precision padding is the part that matters.
+
+const { parseLocalBound, createdWithin } = require('../src/lib/order-window');
+
+test('a minute-precision window includes the whole final minute', () => {
+  const from = parseLocalBound('2026-09-03 22:46');
+  const to = parseLocalBound('2026-09-03 22:56', { end: true });
+
+  assert.strictEqual(from, '2026-09-03T22:46:00');
+  assert.strictEqual(to, '2026-09-03T22:56:59');
+
+  const inside = ['22:46:00', '22:46:12', '22:51:30', '22:56:00', '22:56:59'];
+  for (const t of inside) {
+    assert.ok(createdWithin({ created_at: `2026-09-03T${t}+10:00` }, from, to), `${t} should be in`);
+  }
+  for (const t of ['22:45:59', '22:57:00']) {
+    assert.ok(!createdWithin({ created_at: `2026-09-03T${t}+10:00` }, from, to), `${t} should be out`);
+  }
+});
+
+test('a date-only bound covers the whole day', () => {
+  assert.strictEqual(parseLocalBound('2026-09-03'), '2026-09-03T00:00:00');
+  assert.strictEqual(parseLocalBound('2026-09-03', { end: true }), '2026-09-03T23:59:59');
+});
+
+test('the offset is ignored, so the window is store time not UTC', () => {
+  const from = parseLocalBound('2026-09-03 22:46');
+  const to = parseLocalBound('2026-09-03 22:56', { end: true });
+
+  // 22:50 local is 12:50 UTC; treating it as UTC would put it outside the window.
+  assert.ok(createdWithin({ created_at: '2026-09-03T22:50:00+10:00' }, from, to));
+});
+
+test('an unparseable created_at is excluded rather than swept in', () => {
+  const from = parseLocalBound('2026-09-03 22:46');
+  assert.strictEqual(createdWithin({ created_at: 'yesterday' }, from, null), false);
+  assert.strictEqual(createdWithin({}, from, null), false);
+});
+
+test('unrecognised bound formats are rejected, not guessed at', () => {
+  for (const bad of ['3 September 2026', '2026/09/03 22:46', '22:46', '']) {
+    assert.strictEqual(parseLocalBound(bad), null, `${bad} should be rejected`);
+  }
+});

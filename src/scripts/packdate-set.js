@@ -26,6 +26,7 @@
 require('dotenv').config();
 const { listOrders, getNoteAttribute, updateOrderAttributes, normalizeDate } = require('../shopify');
 const { packDateTag, deliveryDateTag } = require('../lib/order-tags');
+const { parseLocalBound, createdWithin, dateOf } = require('../lib/order-window');
 
 const WRITE_GAP_MS = Number(process.env.SHOPIFY_WRITE_GAP_MS || 550);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -41,6 +42,8 @@ function parseArgs(argv) {
     else if (a === '--dry-run') opts.dryRun = true;
     else if (a === '--overwrite') opts.overwrite = true;
     else if (a === '--no-tag') opts.noTag = true;
+    else if (a === '--created-from') opts.createdFrom = argv[++i];
+    else if (a === '--created-to') opts.createdTo = argv[++i];
     else throw new Error(`unknown flag ${a}`);
   }
   return opts;
@@ -63,15 +66,39 @@ function inRange(orderName, from, to) {
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
 
-  const from = parseName(opts.from);
-  const to = parseName(opts.to);
-  if (!from || !to || !opts.date) {
-    console.error('Usage: --from WM141076 --to WM141141 --date 2026/09/05 [--dry-run] [--overwrite]');
+  const from = opts.from ? parseName(opts.from) : null;
+  const to = opts.to ? parseName(opts.to) : null;
+
+  // Orders can be selected by name range, by when they were placed, or both.
+  const createdFrom = parseLocalBound(opts.createdFrom);
+  const createdTo = parseLocalBound(opts.createdTo, { end: true });
+  const byName = Boolean(from && to);
+  const byTime = Boolean(createdFrom || createdTo);
+
+  if (!opts.date || (!byName && !byTime)) {
+    console.error('Usage: --date 2026/09/05 with either');
+    console.error('  --from WM141076 --to WM141141');
+    console.error('  --created-from "2026-09-03 22:46" --created-to "2026-09-03 22:56"');
     process.exitCode = 1;
     return;
   }
-  if (from.number > to.number) {
+  if (opts.createdFrom && !createdFrom) {
+    console.error(`--created-from ${opts.createdFrom} is not a date/time`);
+    process.exitCode = 1;
+    return;
+  }
+  if (opts.createdTo && !createdTo) {
+    console.error(`--created-to ${opts.createdTo} is not a date/time`);
+    process.exitCode = 1;
+    return;
+  }
+  if (byName && from.number > to.number) {
     console.error(`--from ${opts.from} is after --to ${opts.to}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (createdFrom && createdTo && createdFrom > createdTo) {
+    console.error('--created-from is after --created-to');
     process.exitCode = 1;
     return;
   }
@@ -87,11 +114,13 @@ async function main() {
 
   // Default to 60 days so a range of recent orders is found without walking the
   // whole store; write_orders is limited to about that window anyway.
+  // A time window already names the day, so scan from there rather than 60 days back.
   const since =
-    opts.since || new Date(Date.now() - 60 * 86400000).toISOString().slice(0, 10);
+    opts.since || dateOf(createdFrom) || new Date(Date.now() - 60 * 86400000).toISOString().slice(0, 10);
 
   console.log('store    :', process.env.SHOPIFY_STORE || 'MISSING');
-  console.log('range    :', `${opts.from} .. ${opts.to}`, `(${to.number - from.number + 1} names)`);
+  if (byName) console.log('names    :', `${opts.from} .. ${opts.to}`, `(${to.number - from.number + 1} names)`);
+  if (byTime) console.log('placed   :', `${createdFrom || 'any'} .. ${createdTo || 'any'}`, '(store time)');
   console.log('pack date:', packSlash, tag ? `(tag ${tag})` : '');
   console.log('mode     :', opts.dryRun ? 'DRY RUN (nothing written)' : 'writing');
   console.log('existing :', opts.overwrite ? 'WILL BE REPLACED' : 'left alone');
@@ -113,7 +142,9 @@ async function main() {
 
     scanned += res.orders.length;
     for (const order of res.orders) {
-      if (inRange(order.name, from, to)) found.push(order);
+      if (byName && !inRange(order.name, from, to)) continue;
+      if (byTime && !createdWithin(order, createdFrom, createdTo)) continue;
+      found.push(order);
     }
   } while (pageInfo);
 
@@ -140,7 +171,9 @@ async function main() {
     const wrongWayRound = deliveryIso && packIso >= deliveryIso;
     if (wrongWayRound) suspicious += 1;
 
-    const label = `${order.name} (${String(order.created_at).slice(0, 10)})`;
+    // Show the time, not just the date — when selecting by a ten-minute window the
+    // date alone tells you nothing about whether the right orders were caught.
+    const label = `${order.name} (${String(order.created_at).slice(0, 16).replace('T', ' ')})`;
     const context = `delivery ${deliveryIso || '(none)'}`;
 
     if (existing && !opts.overwrite) {
@@ -191,8 +224,12 @@ async function main() {
         '\nCheck the range and the date before writing — that combination cannot be right.'
     );
   }
-  const missing = to.number - from.number + 1 - found.length;
-  if (missing > 0) console.log(`\n${missing} name(s) in the range were not found in the scanned window.`);
+  if (byName) {
+    const missing = to.number - from.number + 1 - found.length;
+    if (missing > 0) {
+      console.log(`\n${missing} name(s) in the range were not found in the scanned window.`);
+    }
+  }
   if (failed) process.exitCode = 1;
 }
 
