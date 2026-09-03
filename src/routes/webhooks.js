@@ -231,10 +231,17 @@ router.post('/shopify/orders/create', async (req, res) => {
   // date would hand the kitchen something already in the past.
   const pending = FILL_HDS ? pendingHdsFields(order) : [];
   if (pending.length && !rewritten && !rewriteFailed) {
-    const stale = needsRewrite(order).stale;
-    if (stale) {
+    const state = needsRewrite(order);
+    if (state.stale) {
+      // Two different situations, and conflating them hid a real one: an order with
+      // an EXPIRED date cannot be derived from, but an order with NO date needs the
+      // rewrite to compute one — and if rewriting is stood down, nothing will.
+      const noDate = !getNoteAttribute(order, 'Delivery-Date') && !getNoteAttribute(order, 'HDS Delivery Date');
       console.log(
-        `[webhook] order ${orderId}: no HDS records, but its delivery date is expired — not deriving from it`
+        `[webhook] order ${orderId}: ${pending.length} HDS field(s) missing but ` +
+          (noDate
+            ? 'the order has NO delivery date — set REWRITE_RENEWAL_DATES=true so one can be computed'
+            : `its delivery date is expired (${state.current}) — not deriving from it`)
       );
     } else {
       console.log(
@@ -287,7 +294,9 @@ router.post('/shopify/orders/create', async (req, res) => {
       }
     }
 
-    const missing = missingTags(order, tagContext);
+    // atCreation: the webhook runs the moment the order exists, so the cycle count
+    // still describes this order.
+    const missing = missingTags(order, tagContext, { atCreation: true });
     if (missing.length) {
       try {
         await updateOrderAttributes(orderId, { addTags: missing, order });

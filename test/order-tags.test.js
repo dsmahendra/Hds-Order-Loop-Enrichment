@@ -77,3 +77,35 @@ test('an incomplete Loop policy contributes no interval tag', () => {
   assert.ok(!tags.some((t) => t.startsWith('Deliver every')));
   assert.ok(tags.includes('Subscription'));
 });
+
+// --- billing cycle -----------------------------------------------------------
+// Correct only at creation, when completedOrdersCount still describes this order.
+
+test('the billing cycle is the completed count plus one, at creation', () => {
+  const order = attrs({ 'Delivery-Date': '2026/09/07', 'Pick-Pack-Date': '2026/09/05' });
+
+  // A first order: 0 completed, so cycle 1 — matching the live order's tags.
+  const first = tagsForOrder(order, { ...CONTEXT, completedOrdersCount: 0 }, { atCreation: true });
+  assert.ok(first.includes('Billing cycle #1'));
+  assert.ok(first.includes('Subscription First Order'));
+  assert.ok(!first.includes('Subscription Recurring Order'));
+
+  // Two behind it, so cycle 3 — matching the other live order.
+  const third = tagsForOrder(order, { ...CONTEXT, completedOrdersCount: 2 }, { atCreation: true });
+  assert.ok(third.includes('Billing cycle #3'));
+  assert.ok(third.includes('Subscription Recurring Order'));
+});
+
+test('a backfill omits the billing cycle rather than stamping today count on it', () => {
+  const order = attrs({ 'Delivery-Date': '2026/09/07' });
+  const tags = tagsForOrder(order, CONTEXT); // no atCreation
+
+  assert.ok(!tags.some((t) => t.startsWith('Billing cycle')));
+  // The rest still applies — only the count-dependent tag is withheld.
+  assert.ok(tags.includes('Subscription Recurring Order'));
+});
+
+test('an absent count yields neither a cycle nor a first/recurring tag', () => {
+  const tags = subscriptionTags({ subscriptionId: 'shopify-1' }, { atCreation: true });
+  assert.deepStrictEqual(tags, ['Subscription', 'Subscription #1']);
+});
