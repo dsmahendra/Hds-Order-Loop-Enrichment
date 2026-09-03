@@ -4,6 +4,7 @@ const webhooks = require('./routes/webhooks');
 const loopWebhooks = require('./routes/loop-webhooks');
 const shopifyOauth = require('./shopify-oauth');
 const { initQueueProcessor } = require('./jobs/enrich-orders-queue');
+const { initHdsRetry } = require('./jobs/retry-hds-writes');
 
 const app = express();
 
@@ -25,4 +26,6 @@ const PORT = Number(process.env.PORT || 3002);
 app.listen(PORT, () => {
   console.log(`[server] hds-order-enrichment listening on :${PORT}`);
   initQueueProcessor();
+// Safety net for orders whose HDS write did not land on the first attempt.
+initHdsRetry();
 });
