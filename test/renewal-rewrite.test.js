@@ -560,3 +560,71 @@ test('mergeTags replaces the superseded pick-pack tag and keeps the rest', () =>
 test('mergeTags does not duplicate a tag that is already present', () => {
   assert.strictEqual(mergeTags('Subscription, VIP', ['vip']), 'Subscription, VIP');
 });
+
+// --- recomputing over a wrong value ------------------------------------------
+// The additive default protects what is on the order, which is exactly wrong when
+// the thing on the order is the mistake being corrected.
+
+const { fillHdsRecords } = require('../src/lib/renewal-rewrite');
+
+const stubHds = (options) => async () => ({
+  ok: true,
+  status: 200,
+  json: async () => ({
+    success: true,
+    region: { id: 7, name: 'VIC Melbourne Metro' },
+    suburb: { name: 'CARRUM', postcode: '3197' },
+    delivery_options: options,
+  }),
+});
+
+const FRIDAY_SCHEDULE = [
+  {
+    schedule_id: 154,
+    delivery_day: 'Friday',
+    delivery_window: 'AM,Business Hours',
+    cutoff_info: 'Monday 11 PM',
+    delivery_date: '2026-09-11',
+    pack_date: '2026-09-09',
+    production_date: '2026-09-08',
+  },
+];
+
+const HAND_ENTERED = {
+  id: 1,
+  created_at: '2026-09-03T22:50:00+10:00',
+  shipping_address: { city: 'Carrum', zip: '3197' },
+  ...attrs({ 'Delivery-Date': '2026/09/11', 'Pick-Pack-Date': '2026/09/05' }),
+};
+
+test('overwrite replaces a pack date that was set by hand', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = stubHds(FRIDAY_SCHEDULE);
+  try {
+    const out = await fillHdsRecords(HAND_ENTERED, { dryRun: true, overwrite: true });
+
+    assert.equal(out.ok, true);
+    // The schedule's own two-day gap, not the 2026/09/05 that was there.
+    assert.equal(out.attributes['Pick-Pack-Date'], '2026/09/09');
+    // The delivery date it was computed around is unchanged.
+    assert.equal(out.attributes['Delivery-Date'], '2026/09/11');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('without overwrite the wrong pack date is left exactly as it was', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = stubHds(FRIDAY_SCHEDULE);
+  try {
+    const out = await fillHdsRecords(HAND_ENTERED, { dryRun: true });
+
+    assert.equal(out.ok, true);
+    assert.ok(
+      !('Pick-Pack-Date' in out.attributes),
+      'the existing value is protected, which is the default for a reason'
+    );
+  } finally {
+    global.fetch = originalFetch;
+  }
+});

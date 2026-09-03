@@ -18,6 +18,12 @@
 //   --max <n>       stop after scanning n orders
 //   --limit <n>     page size, max 250 (default 250)
 //   --held-only     only orders tagged HDS-Dates-Held, i.e. known failures
+//   --from <name>   first order name to include, e.g. WM141076
+//   --to <name>     last order name to include, inclusive
+//   --recompute     derive the values again and REPLACE what is on the order.
+//                   For correcting a set written wrongly - a pack date entered by
+//                   hand - where the existing values are the problem. Without it
+//                   the sweep only fills what is missing.
 
 require('dotenv').config();
 const { listOrders, getNoteAttribute } = require('../shopify');
@@ -38,6 +44,9 @@ function parseArgs(argv) {
     else if (a === '--max') opts.max = Number(argv[++i]);
     else if (a === '--limit') opts.limit = Math.min(Number(argv[++i]) || 250, 250);
     else if (a === '--held-only') opts.heldOnly = true;
+    else if (a === '--from') opts.from = argv[++i];
+    else if (a === '--to') opts.to = argv[++i];
+    else if (a === '--recompute') opts.recompute = true;
     else throw new Error(`unknown flag ${a}`);
   }
   return opts;
@@ -47,6 +56,22 @@ const packDateOf = (order) =>
   getNoteAttribute(order, 'Pick-Pack-Date') ||
   getNoteAttribute(order, 'HDS Ship Date') ||
   getNoteAttribute(order, 'HDS Pack Date');
+
+// "WM141076" -> { prefix: 'WM', number: 141076 }, compared numerically so a range
+// does not misbehave the moment digit counts differ.
+function parseName(name) {
+  const m = String(name || '').trim().match(/^([^\d]*)(\d+)$/);
+  return m ? { prefix: m[1], number: Number(m[2]) } : null;
+}
+
+function inNameRange(orderName, from, to) {
+  const n = parseName(orderName);
+  if (!n) return false;
+  if (from && n.prefix.toLowerCase() !== from.prefix.toLowerCase()) return false;
+  if (from && n.number < from.number) return false;
+  if (to && n.number > to.number) return false;
+  return true;
+}
 
 const isHeld = (order) =>
   String(order?.tags || '')
@@ -61,6 +86,14 @@ async function main() {
   if (opts.since) console.log('since   :', opts.since);
   if (opts.max) console.log('max     :', opts.max);
   if (opts.heldOnly) console.log('filter  : only orders tagged', HELD_TAG);
+
+  const from = opts.from ? parseName(opts.from) : null;
+  const to = opts.to ? parseName(opts.to) : null;
+  if (opts.from && !from) throw new Error(`--from ${opts.from} is not an order name`);
+  if (opts.to && !to) throw new Error(`--to ${opts.to} is not an order name`);
+  if (from && to && from.number > to.number) throw new Error('--from is after --to');
+  if (from || to) console.log('names   :', `${opts.from || 'any'} .. ${opts.to || 'any'}`);
+  if (opts.recompute) console.log('mode    : RECOMPUTE — existing HDS values will be REPLACED');
   console.log('');
 
   let pageInfo = null;
@@ -89,12 +122,15 @@ async function main() {
       scanned += 1;
 
       if (opts.heldOnly && !isHeld(order)) continue;
+      if ((from || to) && !inNameRange(order.name, from, to)) continue;
 
       const label = `${order.name || order.id} (${String(order.created_at).slice(0, 10)})`;
 
       // Already has a pack date and nothing pending — leave it entirely alone.
+      // With --recompute nothing counts as already done: the point is to replace
+      // values that are present but wrong.
       const plan = planFor(order);
-      if (packDateOf(order) && plan.action === 'tags-only') {
+      if (!opts.recompute && packDateOf(order) && plan.action === 'tags-only') {
         alreadyOk += 1;
         continue;
       }
@@ -102,7 +138,11 @@ async function main() {
       try {
         // atCreation is false: a backfill must not stamp today's billing cycle on
         // an order charged weeks ago.
-        const out = await applyHdsToOrder(order, { dryRun: opts.dryRun, atCreation: false });
+        const out = await applyHdsToOrder(order, {
+          dryRun: opts.dryRun,
+          atCreation: false,
+          recompute: opts.recompute,
+        });
 
         if (!out.ok && out.action === 'hold') {
           held += 1;
@@ -117,9 +157,11 @@ async function main() {
         }
 
         fixed += 1;
-        const pack = out.wrote?.['Pick-Pack-Date'] || packDateOf(order) || '(unchanged)';
+        const before = packDateOf(order);
+        const pack = out.wrote?.['Pick-Pack-Date'] || before || '(unchanged)';
+        const changed = before && pack !== before ? ` (was ${before})` : '';
         console.log(
-          `  ${opts.dryRun ? 'WOULD  ' : 'FIXED  '} ${label}: ${out.action}, pack ${pack}` +
+          `  ${opts.dryRun ? 'WOULD  ' : 'FIXED  '} ${label}: ${out.action}, pack ${pack}${changed}` +
             (out.tagsAdded.length ? `, tags ${out.tagsAdded.join(', ')}` : '')
         );
 
