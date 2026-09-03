@@ -19,6 +19,9 @@ const {
   HELD_TAG,
   hasHdsRecords,
   fillHdsRecords,
+  ensureDateTags,
+  taggingEnabled,
+  missingDateTags,
 } = require('../lib/renewal-rewrite');
 const { buildHdsAttributes } = require('../lib/renewal-date');
 const { legacyLabelUpdates, describeUpdates, isEnabled: renameEnabled } = require('../lib/legacy-labels');
@@ -142,6 +145,7 @@ router.post('/shopify/orders/create', async (req, res) => {
   // the renewals seen so far.
   let rewritten = false;
   let rewriteFailed = false;
+  let filled = false;
   let loopSubscriptionIdEarly = null;
   // Recorded so a questioned date can be explained later: what the order arrived
   // with, and what the resolver locked onto.
@@ -246,6 +250,7 @@ router.post('/shopify/orders/create', async (req, res) => {
           rewriteScheduleSource = filled.locationUsed
             ? `${filled.locationUsed.suburb} ${filled.locationUsed.postcode} via ${filled.locationUsed.source}`
             : null;
+          filled = true;
           console.log(
             `[webhook] order ${orderId}: HDS records added — delivery ${r.delivery_date} kept, ` +
               `ship ${r.pack_date}, production ${r.production_date} [${r.matched_by}]` +
@@ -254,6 +259,23 @@ router.post('/shopify/orders/create', async (req, res) => {
         }
       } catch (err) {
         console.error(`[webhook] order ${orderId}: filling HDS records failed — ${describeError(err)}`);
+      }
+    }
+  }
+
+  // An order that arrived already complete — a normal checkout order, where the
+  // extension has written the whole HDS set — triggers neither the rewrite nor the
+  // fill, and so was getting no tags at all. Arigato and Zapiet used to tag those
+  // and nothing replaced them. No HDS call needed: the dates are already on the
+  // order, so the tags come straight off them.
+  if (taggingEnabled() && !rewritten && !filled) {
+    const missing = missingDateTags(order);
+    if (missing.length) {
+      try {
+        await ensureDateTags(order);
+        console.log(`[webhook] order ${orderId}: tags added — ${missing.join(', ')}`);
+      } catch (err) {
+        console.warn(`[webhook] order ${orderId}: could not add date tags — ${describeError(err)}`);
       }
     }
   }

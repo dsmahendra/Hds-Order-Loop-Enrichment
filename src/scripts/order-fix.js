@@ -26,6 +26,8 @@ const {
   locationFor,
   hasHdsRecords,
   fillHdsRecords,
+  ensureDateTags,
+  missingDateTags,
 } = require('../lib/renewal-rewrite');
 const { buildHdsAttributes } = require('../lib/renewal-date');
 
@@ -110,8 +112,23 @@ async function runOne(orderId, opts) {
   }
 
   if (action === 'skip') {
-    console.log('  skipped — dates look valid and the HDS records are already there');
-    console.log('            (pass --force to recompute anyway)');
+    // The dates are all present, but the tags may still be absent — which is the
+    // normal state of a checkout order now that nothing else tags them.
+    const missing = missingDateTags(order);
+    if (missing.length) {
+      console.log(`  action         : dates are complete; adding the missing tags`);
+      console.log(`  tags to add    : ${missing.join(', ')}`);
+      if (opts.dryRun) {
+        console.log('  [dry-run] nothing written');
+        return { dryRun: true };
+      }
+      await ensureDateTags(order);
+      console.log('  ✓ tags written to the Shopify order');
+      return { written: true };
+    }
+
+    console.log('  skipped — dates and tags are all present');
+    console.log('            (pass --force to recompute the dates anyway)');
     return { skipped: true };
   }
 
