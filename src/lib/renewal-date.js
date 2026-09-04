@@ -41,8 +41,48 @@ function addDays(isoDate, days) {
   return d.toISOString().slice(0, 10);
 }
 
-// Fetch the HDS delivery options for a suburb/postcode.
-async function fetchDeliveryOptions({ postcode, suburb }) {
+// --- HDS lookups under load --------------------------------------------------
+//
+// A Loop renewal run asks HDS about one suburb per order, all at once, and every
+// one of those is a fresh HTTP request for an answer that changes daily at most.
+// Fifty renewals across a dozen suburbs made fifty calls; the same twelve answers
+// would have done.
+//
+// Two things are cached, and the second matters more during a burst:
+//
+//   - a completed answer, for CACHE_TTL_MS
+//   - the IN-FLIGHT request, so concurrent orders for one suburb share the single
+//     call already on its way rather than each starting another
+//
+// The key carries the date because the answer contains dates. The TTL is short
+// for the same reason: a cached answer must not outlive the day it describes.
+const CACHE_TTL_MS = Number(process.env.HDS_CACHE_TTL_MS || 60 * 1000);
+
+// A transient HDS blip used to cost the order its dates outright — the failure
+// was returned, logged, and never retried. Retry the retryable and leave the rest
+// alone: "not serviceable" is a real answer, not a glitch.
+const HDS_ATTEMPTS = Number(process.env.HDS_FETCH_ATTEMPTS || 3);
+
+const optionsCache = new Map(); // key -> { at, promise }
+
+const cacheKey = ({ postcode, suburb }) =>
+  `${new Date().toISOString().slice(0, 10)}|${postcode}|${String(suburb || '').toLowerCase()}`;
+
+function pruneCache(now) {
+  for (const [key, entry] of optionsCache) {
+    if (now - entry.at > CACHE_TTL_MS) optionsCache.delete(key);
+  }
+}
+
+function clearDeliveryOptionsCache() {
+  optionsCache.clear();
+}
+
+const nap = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// One attempt. Returns the same { ok, data } / { ok, reason } shape as before,
+// plus retryable on the failures worth another go.
+async function attemptDeliveryOptions({ postcode, suburb }) {
   const params = new URLSearchParams({ postcode: String(postcode) });
   if (suburb) params.set('suburb', String(suburb));
 
@@ -52,26 +92,73 @@ async function fetchDeliveryOptions({ postcode, suburb }) {
   try {
     res = await fetch(url, { headers: { Accept: 'application/json' } });
   } catch (err) {
-    return { ok: false, reason: `network error: ${err.message}` };
+    return { ok: false, retryable: true, reason: `network error: ${err.message}` };
   }
 
   const data = await res.json().catch(() => null);
   if (!data) {
     // A non-JSON body means we reached SOME server but not the HDS API — almost
     // always a wrong HDS_API_BASE. Saying which base was used turns a blank
-    // "bad JSON" into something actionable.
+    // "bad JSON" into something actionable. A 5xx is the exception: that is HDS
+    // itself struggling, and worth asking again.
     return {
       ok: false,
+      retryable: res.status >= 500,
       reason:
         `HDS returned a non-JSON response (HTTP ${res.status}) from ${base()} — ` +
         'check HDS_API_BASE points at the HDS delivery admin backend',
     };
   }
   if (data.success === false || data.serviceable === false) {
-    return { ok: false, reason: data.error || 'not serviceable' };
+    // A considered "no" from HDS. Asking again would get the same answer.
+    return { ok: false, retryable: false, reason: data.error || 'not serviceable' };
   }
 
   return { ok: true, data };
+}
+
+async function fetchWithRetries(location) {
+  let last = null;
+  for (let attempt = 1; attempt <= HDS_ATTEMPTS; attempt += 1) {
+    last = await attemptDeliveryOptions(location);
+    if (last.ok || !last.retryable) break;
+
+    if (attempt < HDS_ATTEMPTS) {
+      const wait = Math.min(500 * 2 ** (attempt - 1), 4000);
+      console.warn(
+        `[hds] ${location.suburb || ''} ${location.postcode}: ${last.reason} — ` +
+          `attempt ${attempt}/${HDS_ATTEMPTS}, retrying in ${wait}ms`
+      );
+      await nap(wait);
+    }
+  }
+  // retryable is internal bookkeeping; callers only ever needed ok and reason.
+  const { retryable, ...result } = last;
+  return result;
+}
+
+// Fetch the HDS delivery options for a suburb/postcode.
+async function fetchDeliveryOptions({ postcode, suburb }) {
+  const now = Date.now();
+  const key = cacheKey({ postcode, suburb });
+
+  const hit = optionsCache.get(key);
+  if (hit && now - hit.at <= CACHE_TTL_MS) return hit.promise;
+
+  pruneCache(now);
+
+  // The PROMISE goes in the map, not the result, so callers arriving while the
+  // request is still in the air wait on it instead of starting their own.
+  const promise = fetchWithRetries({ postcode, suburb });
+  optionsCache.set(key, { at: now, promise });
+
+  const result = await promise;
+
+  // Never cache a failure: a wrong HDS_API_BASE gets fixed, an outage ends, and
+  // a cached "no" would keep answering for orders that could now succeed.
+  if (!result.ok) optionsCache.delete(key);
+
+  return result;
 }
 
 // Pick the delivery date for a renewal.
@@ -268,6 +355,7 @@ function buildHdsAttributes(resolved, preferredWindow = null) {
 module.exports = {
   resolveRenewalDelivery,
   fetchDeliveryOptions,
+  clearDeliveryOptionsCache,
   cutoffWeekdayOf,
   buildHdsAttributes,
   chooseDeliveryWindow,

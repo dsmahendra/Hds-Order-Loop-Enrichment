@@ -144,7 +144,19 @@ router.post('/shopify/orders/create', async (req, res) => {
   // the renewals seen so far.
   let rewritten = false;
   let rewriteFailed = false;
-  let filled = false;
+
+  // Did this order end up with the HDS data it needs?
+  //
+  // The gap this closes: a write that failed here left the row as 'pending',
+  // the enrichment worker moved it to 'processed', and the retry job only ever
+  // looked at 'skipped' and 'failed'. So an order whose pack date never landed
+  // was indistinguishable from one that succeeded, and nothing tried again. It
+  // stayed wrong until somebody noticed and ran a backfill by hand.
+  //
+  // Recorded separately from status because the two pipelines are separate:
+  // status tracks OUR enrichment tables, this tracks the write onto the
+  // Shopify order.
+  let hdsWriteOk = true;
   let loopSubscriptionIdEarly = null;
   let subscriptionContext = null;
   // Recorded so a questioned date can be explained later: what the order arrived
@@ -193,6 +205,7 @@ router.post('/shopify/orders/create', async (req, res) => {
         const out = await rewriteRenewalOrder(order, { subscriptionAttributes });
         if (!out.ok) {
           rewriteFailed = true;
+          hdsWriteOk = false;
           console.warn(
             `[webhook] order ${orderId}: date rewrite skipped — ${out.reason}` +
               (out.schedule ? ` (schedule from ${out.schedule.derivedFrom})` : '')
@@ -226,6 +239,7 @@ router.post('/shopify/orders/create', async (req, res) => {
         }
       } catch (err) {
         rewriteFailed = true;
+        hdsWriteOk = false;
         console.error(`[webhook] order ${orderId}: date rewrite failed — ${describeError(err)}`);
       }
     }
@@ -245,6 +259,10 @@ router.post('/shopify/orders/create', async (req, res) => {
   if (pending.length && !rewritten && !rewriteFailed) {
     const state = needsRewrite(order);
     if (state.stale) {
+      // Missing fields we chose not to derive are still missing fields. Flagged so
+      // the retry job comes back to it: the delivery date may be rewritten later,
+      // or REWRITE_RENEWAL_DATES turned on, and then these can be computed.
+      hdsWriteOk = false;
       // Two different situations, and conflating them hid a real one: an order with
       // an EXPIRED date cannot be derived from, but an order with NO date needs the
       // rewrite to compute one — and if rewriting is stood down, nothing will.
@@ -260,27 +278,33 @@ router.post('/shopify/orders/create', async (req, res) => {
         `[webhook] order ${orderId}: missing ${pending.length} HDS field(s) — ${pending.join(', ')}`
       );
       try {
-        const filled = await fillHdsRecords(order);
-        if (!filled.ok) {
-          console.warn(`[webhook] order ${orderId}: could not fill HDS records — ${filled.reason}`);
+        // Named 'out' because 'filled' shadowed an outer flag of that name, so
+        // the assignment to it below hit a const and threw. Every successful fill
+        // logged "filling HDS records failed — Assignment to constant variable"
+        // and never logged the dates it had in fact just written, which made a
+        // working path look broken for weeks.
+        const out = await fillHdsRecords(order);
+        if (!out.ok) {
+          hdsWriteOk = false;
+          console.warn(`[webhook] order ${orderId}: could not fill HDS records — ${out.reason}`);
         } else {
-          const r = filled.resolved;
+          const r = out.resolved;
           effectiveDeliveryDate = r.delivery_date;
           effectiveSuburb = r.suburb || effectiveSuburb;
           effectivePostcode = r.postcode || effectivePostcode;
-          effectiveAttributes = buildHdsAttributes(r, filled.attributes['HDS Delivery Window']);
+          effectiveAttributes = buildHdsAttributes(r, out.attributes['HDS Delivery Window']);
           rewriteMatchedBy = r.matched_by || null;
-          rewriteScheduleSource = filled.locationUsed
-            ? `${filled.locationUsed.suburb} ${filled.locationUsed.postcode} via ${filled.locationUsed.source}`
+          rewriteScheduleSource = out.locationUsed
+            ? `${out.locationUsed.suburb} ${out.locationUsed.postcode} via ${out.locationUsed.source}`
             : null;
-          filled = true;
           console.log(
             `[webhook] order ${orderId}: HDS records added — delivery ${r.delivery_date} kept, ` +
               `ship ${r.pack_date}, production ${r.production_date} [${r.matched_by}]` +
-              (filled.tag ? `, tag ${filled.tag}` : '')
+              (out.tag ? `, tag ${out.tag}` : '')
           );
         }
       } catch (err) {
+        hdsWriteOk = false;
         console.error(`[webhook] order ${orderId}: filling HDS records failed — ${describeError(err)}`);
       }
     }
@@ -316,6 +340,7 @@ router.post('/shopify/orders/create', async (req, res) => {
         await updateOrderAttributes(orderId, { addTags: missing, order });
         console.log(`[webhook] order ${orderId}: tags added — ${missing.join(', ')}`);
       } catch (err) {
+        hdsWriteOk = false;
         console.warn(`[webhook] order ${orderId}: could not add tags — ${describeError(err)}`);
       }
     }
@@ -378,8 +403,9 @@ router.post('/shopify/orders/create', async (req, res) => {
       `INSERT INTO orders_to_enrich
          (order_id, delivery_date, delivery_location_id, delivery_time, suburb,
           status, error_message, source, source_attributes,
-          previous_delivery_date, rewrite_matched_by, rewrite_schedule_source)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+          previous_delivery_date, rewrite_matched_by, rewrite_schedule_source,
+          hds_write_ok)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
        ON CONFLICT (order_id) DO NOTHING`,
       [
         orderId,
@@ -395,8 +421,15 @@ router.post('/shopify/orders/create', async (req, res) => {
         previousDeliveryDate,
         rewriteMatchedBy,
         rewriteScheduleSource,
+        hdsWriteOk,
       ]
     );
+
+    if (!hdsWriteOk) {
+      console.warn(
+        `[webhook] order ${orderId}: HDS data incomplete — flagged for the retry job`
+      );
+    }
 
     if (status === 'pending') {
       console.log(`[webhook] queued order ${orderId} (${source}) for enrichment`);

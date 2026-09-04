@@ -34,6 +34,22 @@ ALTER TABLE orders_to_enrich ADD COLUMN IF NOT EXISTS subscription_id BIGINT;
 -- here and skip the HDS API call entirely. Incomplete (or a Loop renewal that
 -- slipped through) falls back to the API.
 ALTER TABLE orders_to_enrich ADD COLUMN IF NOT EXISTS source_attributes JSONB;
+
+-- Did the write onto the SHOPIFY order succeed? Distinct from status, which
+-- tracks our own enrichment tables.
+--
+-- Without this the two pipelines were confused: a failed pack-date write left
+-- status 'pending', the enrichment worker moved it to 'processed', and the retry
+-- job — which only looks at 'skipped' and 'failed' — never saw it. The order sat
+-- with no pack date and nothing indicated anything was wrong. Defaults TRUE so
+-- existing rows are not all re-attempted on deploy.
+ALTER TABLE orders_to_enrich
+  ADD COLUMN IF NOT EXISTS hds_write_ok BOOLEAN NOT NULL DEFAULT TRUE;
+
+-- Partial: the rows worth retrying are the few false ones, so the index stays
+-- small however large the table grows.
+CREATE INDEX IF NOT EXISTS idx_orders_to_enrich_hds_write
+  ON orders_to_enrich(id) WHERE hds_write_ok = FALSE;
 CREATE INDEX IF NOT EXISTS idx_orders_to_enrich_subscription
   ON orders_to_enrich(subscription_id);
 

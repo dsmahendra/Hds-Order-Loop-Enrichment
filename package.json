@@ -17,6 +17,7 @@
     "shopify:webhooks": "node src/scripts/shopify-webhooks.js",
     "packdate:manual": "node src/scripts/packdate-manual.js",
     "packdates:backfill": "node src/scripts/packdates-backfill.js",
+    "packdates:sweep": "node src/scripts/packdates-sweep.js",
     "labels:rename": "node src/scripts/labels-rename.js",
     "test": "node --test \"test/*.test.js\""
   },
