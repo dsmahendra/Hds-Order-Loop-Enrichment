@@ -121,10 +121,12 @@ function windowTimes() {
 //   {"label":"Morning","time":"12:00 AM - 7:00 AM"}    the range and the name the
 //                                                     customer actually chose
 //
-// The second form exists because the order page showed "8:00 AM - 6:00 PM" and
-// nothing said WHICH window that was, while the checkout had offered it as
-// "Daytime". Anyone reading the order had to know the ranges by heart to tell
-// Daytime from Morning, and the two do not overlap in any obvious way.
+// The label is recorded so it is AVAILABLE, not so it is written: by default
+// Delivery-Time still holds the range alone. What the object form actually buys
+// is that the range follows the window the customer chose — Morning yields
+// "12:00 AM - 7:00 AM" and Daytime "8:00 AM - 6:00 PM" — with the name kept
+// beside it for anything that wants to name the window without re-deriving it
+// from a pair of times.
 function windowEntryFor(window) {
   if (!window) return null;
   const map = windowTimes();
@@ -154,12 +156,14 @@ function windowEntryFor(window) {
 
 // How the label and the range are combined.
 //
-// A template rather than a fixed format because Delivery-Time is read
-// downstream: if a consumer turns out to want the bare range, "{time}" restores
-// exactly the previous value through configuration alone.
+// The default is the range ALONE — "8:00 AM - 6:00 PM" — because that is what
+// Delivery-Time has always held and what reads it downstream. A window's label
+// is available to whoever wants it via the template, but it is opt-in: putting a
+// word in front of the range by default would change a value other systems parse
+// on the strength of nothing more than it reading nicely.
 function deliveryTimeFormat() {
   const raw = process.env.DELIVERY_TIME_FORMAT;
-  return raw && raw.trim() ? raw : '{label} {time}';
+  return raw && raw.trim() ? raw : '{time}';
 }
 
 function timeRangeForWindow(window) {
