@@ -115,13 +115,67 @@ function windowTimes() {
   return map;
 }
 
-function timeRangeForWindow(window) {
+// A window's configured value may take either form:
+//
+//   "12:00 AM - 7:00 AM"                              the clock range alone
+//   {"label":"Morning","time":"12:00 AM - 7:00 AM"}    the range and the name the
+//                                                     customer actually chose
+//
+// The second form exists because the order page showed "8:00 AM - 6:00 PM" and
+// nothing said WHICH window that was, while the checkout had offered it as
+// "Daytime". Anyone reading the order had to know the ranges by heart to tell
+// Daytime from Morning, and the two do not overlap in any obvious way.
+function windowEntryFor(window) {
   if (!window) return null;
   const map = windowTimes();
-  if (map[window]) return map[window];
-  // Tolerate casing drift between the schedule and the configured keys.
-  const hit = Object.keys(map).find((k) => k.toLowerCase() === String(window).toLowerCase());
-  return hit ? map[hit] : null;
+
+  let value = map[window];
+  if (value === undefined) {
+    // Tolerate casing drift between the schedule and the configured keys.
+    const hit = Object.keys(map).find((k) => k.toLowerCase() === String(window).toLowerCase());
+    if (hit === undefined) return null;
+    value = map[hit];
+  }
+
+  if (typeof value === 'string') return { label: null, time: value };
+
+  if (value && typeof value === 'object') {
+    // 'time'/'range' and 'label'/'name' both accepted: this is hand-written JSON
+    // in an environment variable, and rejecting a reasonable spelling would fail
+    // silently as an unmapped window.
+    const time = value.time || value.range || null;
+    const label = value.label || value.name || null;
+    if (!time && !label) return null;
+    return { label, time };
+  }
+
+  return null;
+}
+
+// How the label and the range are combined.
+//
+// A template rather than a fixed format because Delivery-Time is read
+// downstream: if a consumer turns out to want the bare range, "{time}" restores
+// exactly the previous value through configuration alone.
+function deliveryTimeFormat() {
+  const raw = process.env.DELIVERY_TIME_FORMAT;
+  return raw && raw.trim() ? raw : '{label} {time}';
+}
+
+function timeRangeForWindow(window) {
+  const entry = windowEntryFor(window);
+  if (!entry) return null;
+
+  // Either half on its own is still worth writing; there is just nothing to join.
+  if (!entry.label) return entry.time;
+  if (!entry.time) return entry.label;
+
+  return deliveryTimeFormat()
+    .split('{label}')
+    .join(entry.label)
+    .split('{time}')
+    .join(entry.time)
+    .trim();
 }
 
 // The note attributes to write back, in the exact spellings already on the order.

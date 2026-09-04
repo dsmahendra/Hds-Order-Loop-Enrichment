@@ -628,3 +628,98 @@ test('without overwrite the wrong pack date is left exactly as it was', async ()
     global.fetch = originalFetch;
   }
 });
+
+// --- the window NAME on the order, not just its clock range ------------------
+// The order page showed "8:00 AM - 6:00 PM" and nothing said which window that
+// was, while the checkout had offered it as "Daytime". Reading an order meant
+// knowing the ranges by heart. The configured value may now carry the label too.
+
+const LABELLED_WINDOWS = JSON.stringify({
+  AM: { label: 'Morning', time: '12:00 AM - 7:00 AM' },
+  'Business Hours': { label: 'Daytime', time: '8:00 AM - 6:00 PM' },
+});
+
+const withTimeFormat = (format, fn) => {
+  const saved = process.env.DELIVERY_TIME_FORMAT;
+  if (format === undefined) delete process.env.DELIVERY_TIME_FORMAT;
+  else process.env.DELIVERY_TIME_FORMAT = format;
+  try {
+    return fn();
+  } finally {
+    if (saved === undefined) delete process.env.DELIVERY_TIME_FORMAT;
+    else process.env.DELIVERY_TIME_FORMAT = saved;
+  }
+};
+
+test('Delivery-Time carries the window name alongside the range', () => {
+  withWindowTimes(LABELLED_WINDOWS, () => {
+    withTimeFormat(undefined, () => {
+      assert.strictEqual(
+        buildOrderAttributes(RESOLVED)['Delivery-Time'],
+        'Morning 12:00 AM - 7:00 AM'
+      );
+
+      const daytime = buildOrderAttributes(RESOLVED, { preferredWindow: 'Business Hours' });
+      assert.strictEqual(daytime['Delivery-Time'], 'Daytime 8:00 AM - 6:00 PM');
+    });
+  });
+});
+
+test('the plain string form still means the range alone', () => {
+  // Live configuration uses it, so it must keep working untouched.
+  withWindowTimes(WINDOW_TIMES, () => {
+    assert.strictEqual(buildOrderAttributes(RESOLVED)['Delivery-Time'], '12:00 AM - 7:00 AM');
+  });
+});
+
+test('the format is a template, so the old value is recoverable without a deploy', () => {
+  // Delivery-Time is read downstream. If a consumer turns out to need the bare
+  // range, this restores it through configuration rather than a code change.
+  withWindowTimes(LABELLED_WINDOWS, () => {
+    withTimeFormat('{time}', () => {
+      assert.strictEqual(buildOrderAttributes(RESOLVED)['Delivery-Time'], '12:00 AM - 7:00 AM');
+    });
+    withTimeFormat('{label} ({time})', () => {
+      assert.strictEqual(
+        buildOrderAttributes(RESOLVED)['Delivery-Time'],
+        'Morning (12:00 AM - 7:00 AM)'
+      );
+    });
+  });
+});
+
+test('either spelling of the two keys is accepted', () => {
+  // Hand-written JSON in an environment variable: rejecting a reasonable
+  // spelling would surface as an unmapped window, which says nothing useful.
+  withWindowTimes('{"AM":{"name":"Morning","range":"12:00 AM - 7:00 AM"}}', () => {
+    assert.strictEqual(timeRangeForWindow('AM'), 'Morning 12:00 AM - 7:00 AM');
+  });
+});
+
+test('a labelled window tolerates the same casing drift as before', () => {
+  withWindowTimes(LABELLED_WINDOWS, () => {
+    assert.strictEqual(timeRangeForWindow('am'), 'Morning 12:00 AM - 7:00 AM');
+    assert.strictEqual(timeRangeForWindow('BUSINESS HOURS'), 'Daytime 8:00 AM - 6:00 PM');
+  });
+});
+
+test('half a mapping is written rather than discarded', () => {
+  withWindowTimes('{"AM":{"label":"Morning"}}', () => {
+    assert.strictEqual(timeRangeForWindow('AM'), 'Morning');
+  });
+  withWindowTimes('{"AM":{"time":"12:00 AM - 7:00 AM"}}', () => {
+    assert.strictEqual(timeRangeForWindow('AM'), '12:00 AM - 7:00 AM');
+  });
+});
+
+test('an unusable mapping leaves Delivery-Time alone rather than blanking it', () => {
+  // Writing an empty string would replace a correct customer-visible value with
+  // nothing, which is worse than leaving it as it was.
+  withWindowTimes('{"AM":{}}', () => {
+    assert.strictEqual(timeRangeForWindow('AM'), null);
+    assert.ok(!('Delivery-Time' in buildOrderAttributes(RESOLVED)));
+  });
+  withWindowTimes('{"AM":42}', () => {
+    assert.strictEqual(timeRangeForWindow('AM'), null);
+  });
+});
