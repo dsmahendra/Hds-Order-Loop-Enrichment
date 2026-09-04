@@ -139,7 +139,12 @@ async function main() {
   console.log('pack date:', packSlash || 'computed per order from HDS');
   console.log('mode     :', opts.dryRun ? 'DRY RUN (nothing written)' : 'writing');
   console.log('existing :', opts.overwrite ? 'WILL BE REPLACED' : 'left alone');
-  console.log('changes  : Pick-Pack-Date only' + (opts.tags ? ' + its tag' : ' — no tags, no other attribute'));
+  console.log(
+    'changes  : Pick-Pack-Date' +
+      (opts.tags
+        ? ' + its tag (every existing tag kept)'
+        : ' only — no tags, no other attribute')
+  );
   console.log('');
 
   // The window names its own day, so start the scan there.
