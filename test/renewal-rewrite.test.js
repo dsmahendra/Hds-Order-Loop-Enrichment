@@ -629,10 +629,13 @@ test('without overwrite the wrong pack date is left exactly as it was', async ()
   }
 });
 
-// --- the window NAME on the order, not just its clock range ------------------
-// The order page showed "8:00 AM - 6:00 PM" and nothing said which window that
-// was, while the checkout had offered it as "Daytime". Reading an order meant
-// knowing the ranges by heart. The configured value may now carry the label too.
+// --- the range follows the chosen window ------------------------------------
+// Delivery-Time holds the clock range and nothing else: "8:00 AM - 6:00 PM", the
+// form it has always had and the form whatever reads it downstream expects. What
+// the labelled config buys is that the RANGE tracks the window the customer
+// picked. The window's name is recorded alongside so anything that wants to name
+// it need not re-derive it from a pair of times, but it is never written into
+// Delivery-Time unless asked for explicitly.
 
 const LABELLED_WINDOWS = JSON.stringify({
   AM: { label: 'Morning', time: '12:00 AM - 7:00 AM' },
@@ -651,16 +654,29 @@ const withTimeFormat = (format, fn) => {
   }
 };
 
-test('Delivery-Time carries the window name alongside the range', () => {
+test('Delivery-Time is the range alone, and follows the chosen window', () => {
   withWindowTimes(LABELLED_WINDOWS, () => {
     withTimeFormat(undefined, () => {
-      assert.strictEqual(
-        buildOrderAttributes(RESOLVED)['Delivery-Time'],
-        'Morning 12:00 AM - 7:00 AM'
-      );
+      // No "Morning", no "Daytime" — just the numbers, as the order page shows.
+      assert.strictEqual(buildOrderAttributes(RESOLVED)['Delivery-Time'], '12:00 AM - 7:00 AM');
 
       const daytime = buildOrderAttributes(RESOLVED, { preferredWindow: 'Business Hours' });
-      assert.strictEqual(daytime['Delivery-Time'], 'Daytime 8:00 AM - 6:00 PM');
+      assert.strictEqual(daytime['Delivery-Time'], '8:00 AM - 6:00 PM');
+    });
+  });
+});
+
+test('a configured label never leaks into Delivery-Time by default', () => {
+  // The guard on the whole feature: the label exists in configuration, and an
+  // order carries a value other systems parse. One must not become the other by
+  // accident.
+  withWindowTimes(LABELLED_WINDOWS, () => {
+    withTimeFormat(undefined, () => {
+      for (const window of ['AM', 'Business Hours']) {
+        const value = timeRangeForWindow(window);
+        assert.doesNotMatch(value, /Morning|Daytime/i, `${window} wrote "${value}"`);
+        assert.match(value, /^\d{1,2}:\d{2} [AP]M - \d{1,2}:\d{2} [AP]M$/, 'numbers only');
+      }
     });
   });
 });
@@ -672,9 +688,7 @@ test('the plain string form still means the range alone', () => {
   });
 });
 
-test('the format is a template, so the old value is recoverable without a deploy', () => {
-  // Delivery-Time is read downstream. If a consumer turns out to need the bare
-  // range, this restores it through configuration rather than a code change.
+test('the label can be opted into, and is off unless it is', () => {
   withWindowTimes(LABELLED_WINDOWS, () => {
     withTimeFormat('{time}', () => {
       assert.strictEqual(buildOrderAttributes(RESOLVED)['Delivery-Time'], '12:00 AM - 7:00 AM');
@@ -692,14 +706,21 @@ test('either spelling of the two keys is accepted', () => {
   // Hand-written JSON in an environment variable: rejecting a reasonable
   // spelling would surface as an unmapped window, which says nothing useful.
   withWindowTimes('{"AM":{"name":"Morning","range":"12:00 AM - 7:00 AM"}}', () => {
-    assert.strictEqual(timeRangeForWindow('AM'), 'Morning 12:00 AM - 7:00 AM');
+    withTimeFormat(undefined, () => {
+      assert.strictEqual(timeRangeForWindow('AM'), '12:00 AM - 7:00 AM');
+    });
+    withTimeFormat('{label} {time}', () => {
+      assert.strictEqual(timeRangeForWindow('AM'), 'Morning 12:00 AM - 7:00 AM');
+    });
   });
 });
 
 test('a labelled window tolerates the same casing drift as before', () => {
   withWindowTimes(LABELLED_WINDOWS, () => {
-    assert.strictEqual(timeRangeForWindow('am'), 'Morning 12:00 AM - 7:00 AM');
-    assert.strictEqual(timeRangeForWindow('BUSINESS HOURS'), 'Daytime 8:00 AM - 6:00 PM');
+    withTimeFormat(undefined, () => {
+      assert.strictEqual(timeRangeForWindow('am'), '12:00 AM - 7:00 AM');
+      assert.strictEqual(timeRangeForWindow('BUSINESS HOURS'), '8:00 AM - 6:00 PM');
+    });
   });
 });
 
