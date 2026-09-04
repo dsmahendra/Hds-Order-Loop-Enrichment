@@ -26,10 +26,15 @@ let running = false;
 // Rows the webhook left incomplete. 'skipped' covers a held order and one whose
 // rewrite failed; 'failed' covers an exhausted enrichment. Oldest first, so a
 // backlog drains in the order it accumulated.
+//
+// hds_write_ok = FALSE is the case those two statuses missed entirely: the order
+// HAD a delivery date, so it was queued 'pending' and enriched normally, but the
+// write of the pack date onto the Shopify order did not land. Status alone could
+// not tell that apart from success, so nothing ever retried it.
 const SELECT_PENDING = `
-  SELECT order_id, status, attempts, error_message
+  SELECT order_id, status, attempts, error_message, hds_write_ok
     FROM orders_to_enrich
-   WHERE status IN ('skipped', 'failed')
+   WHERE (status IN ('skipped', 'failed') OR hds_write_ok = FALSE)
      AND attempts < $1
    ORDER BY id ASC
    LIMIT $2
@@ -60,7 +65,8 @@ async function retryOne(row) {
   // rebuilt from the corrected attributes.
   await pool.query(
     `UPDATE orders_to_enrich
-        SET status = 'pending', attempts = 0, error_message = NULL, updated_at = NOW()
+        SET status = 'pending', attempts = 0, error_message = NULL,
+            hds_write_ok = TRUE, updated_at = NOW()
       WHERE order_id = $1`,
     [orderId]
   );

@@ -92,7 +92,62 @@ function describeAdminToken(token) {
   return `set (unrecognised format, ${shape})`;
 }
 
-// One place for Admin API calls: base URL, auth header, and error shape.
+// --- pacing every Admin API call --------------------------------------------
+//
+// Shopify's REST bucket allows 2 calls/second sustained (40 deep; 4/s on Plus).
+// A single order is nowhere near that. A Loop renewal run is: Loop charges dozens
+// of subscriptions at once, Shopify delivers those webhooks CONCURRENTLY, and
+// each handler makes three or four writes. Independent handlers firing together
+// empty the bucket, Shopify answers 429 — and nothing here retried a 429, so the
+// write was simply lost and that order never got its dates.
+//
+// So every Admin API call goes through one queue: concurrency 1, consecutive
+// calls at least MIN_GAP_MS apart. A burst QUEUES instead of failing. It is
+// slower per order and completely indifferent to how many arrive at once, which
+// is the right trade when the alternative is a missing pack date.
+const MIN_GAP_MS = Number(process.env.SHOPIFY_MIN_GAP_MS || 550);
+
+// 429 and 5xx both deserve another go: the first means "too fast", the second is
+// Shopify being briefly unavailable. Other 4xx do not — a wrong token or a
+// rejected payload fails identically however many times it is sent.
+const MAX_ATTEMPTS = Number(process.env.SHOPIFY_MAX_ATTEMPTS || 5);
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+let queue = Promise.resolve();
+let lastCallAt = 0;
+
+// Run task() behind everything already queued, and no sooner than MIN_GAP_MS
+// after the previous call began.
+function paced(task) {
+  const result = queue.then(async () => {
+    const wait = lastCallAt + MIN_GAP_MS - Date.now();
+    if (wait > 0) await sleep(wait);
+    lastCallAt = Date.now();
+    return task();
+  });
+
+  // The chain has to survive a rejection. Without swallowing it here, one failed
+  // call rejects the shared promise and every call queued behind it fails too —
+  // which during a burst would turn a single 500 into a wave of losses.
+  queue = result.then(
+    () => {},
+    () => {}
+  );
+  return result;
+}
+
+// How long before retrying. Shopify states it in Retry-After on a 429; absent
+// that, back off exponentially rather than hammering a service already saying no.
+function retryWaitMs(headers, attempt) {
+  const stated = Number(headers?.get?.('retry-after'));
+  if (Number.isFinite(stated) && stated > 0) return Math.ceil(stated * 1000);
+  return Math.min(1000 * 2 ** (attempt - 1), 16000);
+}
+
+const isRetryable = (status) => status === 429 || status >= 500;
+
+// One place for Admin API calls: base URL, auth header, pacing, and error shape.
 async function shopifyRequestWithHeaders(method, path, body) {
   const store = process.env.SHOPIFY_STORE;
   const version = process.env.SHOPIFY_API_VERSION || '2024-01';
@@ -102,7 +157,8 @@ async function shopifyRequestWithHeaders(method, path, body) {
   const token = resolved.token;
   if (!token) throw new Error(resolved.error || 'no Admin API token available');
 
-  return fetch(`https://${store}/admin/api/${version}${path}`, {
+  const url = `https://${store}/admin/api/${version}${path}`;
+  const init = {
     method,
     headers: {
       'X-Shopify-Access-Token': token,
@@ -110,7 +166,11 @@ async function shopifyRequestWithHeaders(method, path, body) {
       Accept: 'application/json',
     },
     body: body === undefined ? undefined : JSON.stringify(body),
-  }).then(async (res) => {
+  };
+
+  for (let attempt = 1; ; attempt += 1) {
+    const res = await paced(() => fetch(url, init));
+
     const text = await res.text().catch(() => '');
     let data = null;
     try {
@@ -118,24 +178,39 @@ async function shopifyRequestWithHeaders(method, path, body) {
     } catch {
       // Non-JSON body — the raw text carries the reason.
     }
-    if (!res.ok) {
-      const reason = data?.errors ? JSON.stringify(data.errors) : text.slice(0, 200);
-      let hint = '';
-      if (res.status === 401) {
-        // 401 is authentication: the token is not recognised at all. Worth
-        // distinguishing from 403, which means it authenticated but lacks a scope.
-        hint =
-          `\n  -> 401 is authentication, not scopes. SHOPIFY_ADMIN_TOKEN is ${describeAdminToken(token)}` +
-          `\n  -> check it is an Admin API access token for ${store}, and that the app is still installed`;
-      } else if (res.status === 403) {
-        hint = '\n  -> 403 is scopes: the token authenticated but lacks write_orders';
-      }
-      throw new Error(`Shopify ${method} ${path} failed ${res.status}: ${reason}${hint}`);
+
+    if (res.ok) {
+      // Headers matter for paging: the REST API returns its cursor in Link, not
+      // in the body. Callers that only want the body use shopifyRequest().
+      return { data, headers: res.headers };
     }
-    // Headers matter for paging: the REST API returns its cursor in Link, not in
-    // the body. Callers that only want the body use shopifyRequest().
-    return { data, headers: res.headers };
-  });
+
+    if (isRetryable(res.status) && attempt < MAX_ATTEMPTS) {
+      const wait = retryWaitMs(res.headers, attempt);
+      console.warn(
+        `[shopify] ${method} ${path} → ${res.status}, attempt ${attempt}/${MAX_ATTEMPTS} — retrying in ${wait}ms`
+      );
+      await sleep(wait);
+      continue;
+    }
+
+    const reason = data?.errors ? JSON.stringify(data.errors) : text.slice(0, 200);
+    let hint = '';
+    if (res.status === 401) {
+      // 401 is authentication: the token is not recognised at all. Worth
+      // distinguishing from 403, which means it authenticated but lacks a scope.
+      hint =
+        `\n  -> 401 is authentication, not scopes. SHOPIFY_ADMIN_TOKEN is ${describeAdminToken(token)}` +
+        `\n  -> check it is an Admin API access token for ${store}, and that the app is still installed`;
+    } else if (res.status === 403) {
+      hint = '\n  -> 403 is scopes: the token authenticated but lacks write_orders';
+    } else if (res.status === 429) {
+      hint =
+        `\n  -> 429 is rate limiting, and this gave up after ${MAX_ATTEMPTS} attempts` +
+        '\n  -> raise SHOPIFY_MIN_GAP_MS to space calls further apart';
+    }
+    throw new Error(`Shopify ${method} ${path} failed ${res.status}: ${reason}${hint}`);
+  }
 }
 
 function shopifyRequest(method, path, body) {

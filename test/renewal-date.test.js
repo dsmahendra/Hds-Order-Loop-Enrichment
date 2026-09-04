@@ -1,12 +1,20 @@
 const test = require('node:test');
+const { beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   resolveRenewalDelivery,
   buildHdsAttributes,
   toChargeDate,
   addDays,
+  clearDeliveryOptionsCache,
 } = require('../src/lib/renewal-date');
 const { parseUpcoming } = require('../src/routes/loop-webhooks');
+
+// HDS answers are cached briefly and shared between concurrent callers, which is
+// what stops a Loop burst making one call per order. Every test here stubs a
+// different response for the same suburb, so each needs a clean slate — without
+// this they would read each other's answers.
+beforeEach(() => clearDeliveryOptionsCache());
 
 function stubOptions(options, extra = {}) {
   return async () => ({

@@ -5,6 +5,8 @@ const loopWebhooks = require('./routes/loop-webhooks');
 const shopifyOauth = require('./shopify-oauth');
 const { initQueueProcessor } = require('./jobs/enrich-orders-queue');
 const { initHdsRetry } = require('./jobs/retry-hds-writes');
+const { initPackDateSweep } = require('./jobs/sweep-missing-packdates');
+const { applySchema } = require('./db-bootstrap');
 
 const app = express();
 
@@ -23,9 +25,19 @@ app.use('/', shopifyOauth);
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'hds-order-enrichment' }));
 
 const PORT = Number(process.env.PORT || 3002);
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`[server] hds-order-enrichment listening on :${PORT}`);
+
+  // Before the jobs: the queue INSERT depends on columns this adds, and a deploy
+  // that skipped a manual migrate would otherwise fail every write.
+  await applySchema();
+
   initQueueProcessor();
-// Safety net for orders whose HDS write did not land on the first attempt.
-initHdsRetry();
+
+  // Safety net for orders whose HDS write did not land on the first attempt.
+  initHdsRetry();
+
+  // Last line of defence, and the only one that does not depend on the webhook
+  // having arrived or on our queue holding a row for the order.
+  initPackDateSweep();
 });
