@@ -5,12 +5,14 @@
 // Read-only. Everything that feeds the decision, in the order it is consulted, so
 // a questioned date can be traced to its input rather than guessed at:
 //
+//   0. configuration            the switches that decide the outcome
 //   1. the Shopify order        what it carries now
 //   2. the Loop subscription    its Delivery-Date — the only weekday Loop records
 //   3. weekday resolution       which source won, and what it said
 //   4. HDS availability         what was actually on offer for that suburb
 //   5. both selection modes     what each rule would produce
-//   6. the queue row            what we recorded at the time
+//   6. the verdict              what would happen now, and what is blocking it
+//   7. the queue row            what we recorded at the time
 //
 // Works with Loop alone; Shopify and Postgres sections are skipped if their
 // credentials are absent.
@@ -19,6 +21,8 @@ require('dotenv').config();
 const { getOrder, getNoteAttribute } = require('../shopify');
 const { subscriptionContextForOrder, readSubscriptionByOrderId } = require('../loop');
 const { scheduleFor, rewriteRenewalOrder, needsRewrite, locationFor, weekdayOf } = require('../lib/renewal-rewrite');
+const { fillHdsRecords } = require('../lib/renewal-rewrite');
+const { planFor } = require('../lib/apply-hds');
 
 function parseArgs(argv) {
   const opts = {};
@@ -48,6 +52,29 @@ async function main() {
   }
 
   console.log(`Explaining order ${opts.order}`);
+
+  // --- 0. the switches -------------------------------------------------------
+  // Printed first because they decide the outcome, and because a value set on one
+  // environment and not another is invisible from the order page. Most "no pack
+  // date" reports come down to a line in here.
+  heading(0, 'Configuration in this environment');
+  const flag = (name, fallback) => {
+    const raw = process.env[name];
+    return raw === undefined || raw === '' ? `${fallback} (default)` : raw;
+  };
+  console.log(`   REWRITE_RENEWAL_DATES : ${flag('REWRITE_RENEWAL_DATES', 'true')}`);
+  console.log(`   FILL_HDS_RECORDS      : ${flag('FILL_HDS_RECORDS', 'true')}`);
+  console.log(`   FILL_HDS_ATTRIBUTES   : ${flag('FILL_HDS_ATTRIBUTES', 'all-missing')}`);
+  console.log(`   HDS_API_BASE          : ${process.env.HDS_API_BASE || 'MISSING'}`);
+  console.log(`   SHOPIFY_STORE         : ${process.env.SHOPIFY_STORE || 'MISSING'}`);
+
+  if (String(process.env.REWRITE_RENEWAL_DATES || '').toLowerCase() === 'false') {
+    console.log('');
+    console.log('   WARNING: rewriting is stood down. A Loop renewal arrives carrying the');
+    console.log("   subscription's FIRST-cycle dates, which are already in the past, so with");
+    console.log('   this false those orders are HELD and never get a pack date. This is the');
+    console.log('   most common cause of "no pack date on any renewal".');
+  }
 
   // --- 1. the Shopify order --------------------------------------------------
   heading(1, 'The Shopify order');
@@ -204,7 +231,60 @@ async function main() {
   else process.env.RENEWAL_DELIVERY_SELECTION = saved;
 
   // --- 6. the queue row -----------------------------------------------------
-  heading(6, 'What we recorded at the time');
+  // --- 6. the verdict --------------------------------------------------------
+  // The point of the whole report. Everything above is inputs; this is what the
+  // service would actually DO with this order right now, and — when the answer is
+  // "nothing" — which switch is responsible. "No pack date" has several causes
+  // that look identical on the order page, and guessing between them by reading
+  // sections 1 to 5 was the slow part.
+  heading(6, 'What would happen to this order now');
+
+  const packNow = getNoteAttribute(order, 'Pick-Pack-Date');
+  const plan = planFor(order);
+  console.log(`   pack date now : ${packNow || 'NONE'}`);
+  console.log(`   action        : ${plan.action} — ${plan.reason}`);
+
+  if (plan.action === 'hold') {
+    console.log('');
+    console.log('   THIS IS WHY THERE IS NO PACK DATE.');
+    console.log('   The delivery date has already passed, so a pack date cannot be derived');
+    console.log('   from it, and REWRITE_RENEWAL_DATES=false forbids computing a new one.');
+    console.log('');
+    console.log('   Every Loop renewal arrives in this state: Loop copies the subscription');
+    console.log("   attributes verbatim, so the order carries the FIRST cycle's dates, which");
+    console.log('   are in the past by definition. With rewriting stood down, none of them');
+    console.log('   can be given a pack date.');
+    console.log('');
+    console.log('   Fix: set REWRITE_RENEWAL_DATES=true, then re-run the backfill.');
+  } else if (plan.action === 'fill') {
+    const out = await fillHdsRecords(order, { dryRun: true, overwrite: true });
+    if (out.ok) {
+      console.log(`   would write   : Pick-Pack-Date ${out.attributes['Pick-Pack-Date']}`);
+      console.log(`   from          : ${out.resolved.matched_by}`);
+      console.log('');
+      console.log('   The values are available, so a pack date is NOT blocked by data — if the');
+      console.log('   order still has none, the write itself never ran or never landed.');
+      console.log('   Check section 7: no queue row means the webhook never processed it.');
+    } else {
+      console.log('');
+      console.log(`   THIS IS WHY THERE IS NO PACK DATE: ${out.reason}`);
+      if (/no postcode and suburb/.test(out.reason)) {
+        console.log('   The order has no shipping address and no HDS Postcode/Suburb, so there');
+        console.log('   is nothing to look the schedule up by.');
+      } else if (/no .* schedule/.test(out.reason)) {
+        console.log('   HDS does not offer that weekday for this suburb, so the delivery date');
+        console.log('   on the order cannot be matched to a schedule. Section 4 lists what it');
+        console.log('   does offer.');
+      }
+    }
+  } else if (plan.action === 'rewrite') {
+    console.log('   Section 5 shows what the rewrite would write. If the order still has no');
+    console.log('   pack date, the write never ran or never landed — check section 7.');
+  } else {
+    console.log('   Nothing to do: the dates are complete.');
+  }
+
+  heading(7, 'What we recorded at the time');
   if (!process.env.DATABASE_URL) {
     console.log('   (no DATABASE_URL — run on the Railway shell to see this)');
     return;
