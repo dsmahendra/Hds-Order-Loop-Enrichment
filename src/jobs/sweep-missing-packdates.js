@@ -206,10 +206,18 @@ function initPackDateSweep() {
       `ignoring orders under ${MIN_AGE_MINUTES}m old, up to ${MAX_FIXES} fixes per pass)`
   );
 
-  // Not on boot: a restart is exactly when a webhook backlog is being delivered,
-  // and sweeping into that duplicates the work. One interval later the picture
-  // has settled.
   setInterval(tick, INTERVAL_MS);
+
+  // A first pass shortly after boot, not a full interval later. A deploy is
+  // exactly when someone is watching to see whether orders are being fixed, and
+  // making them wait half an hour to find out is the difference between a
+  // deployment they can verify and one they have to take on trust.
+  //
+  // Safe to run this early because the sweep ignores orders younger than
+  // MIN_AGE_MINUTES, so it cannot collide with the webhook backlog a restart
+  // delivers — those orders are all newer than that.
+  const firstPass = Number(process.env.SWEEP_FIRST_PASS_MS || 2 * 60 * 1000);
+  if (firstPass >= 0) setTimeout(tick, firstPass).unref?.();
 }
 
 module.exports = { initPackDateSweep, sweep, tick, needsWork };
