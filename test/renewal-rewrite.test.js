@@ -9,6 +9,7 @@ const {
   toSlashDate,
   locationFor,
   timeRangeForWindow,
+  DEFAULT_DELIVERY_TIME,
   isPostcodeShaped,
   previousTuple,
   SUPERSEDED_ATTRIBUTES,
@@ -176,17 +177,15 @@ test('buildOrderAttributes keeps the customer window when the schedule offers it
 });
 
 test('buildOrderAttributes never writes the fields other systems own', () => {
-  const keys = Object.keys(buildOrderAttributes(RESOLVED));
-  const owned = [
-    'Delivery-Time',
-    'Delivery-Location-Id',
-    'Delivery-Slot-Id',
-    'Checkout-Method',
-    '_amp_sc',
-  ];
+  // Delivery-Time is excluded here on purpose: unlike the rest of this list it
+  // IS ours to fill now (see the Delivery-Time mapping tests below) — just
+  // never to overwrite a value the order already carries.
+  const keys = Object.keys(buildOrderAttributes(RESOLVED, { existingDeliveryTime: '6:00 AM - 6:00 PM' }));
+  const owned = ['Delivery-Location-Id', 'Delivery-Slot-Id', 'Checkout-Method', '_amp_sc'];
   for (const key of owned) {
     assert.ok(!keys.includes(key), 'must not write ' + key);
   }
+  assert.ok(!('Delivery-Time' in buildOrderAttributes(RESOLVED, { existingDeliveryTime: '6:00 AM - 6:00 PM' })));
 });
 
 test('buildOrderAttributes omits keys it could not derive', () => {
@@ -212,9 +211,17 @@ const withWindowTimes = (json, fn) => {
 
 const WINDOW_TIMES = '{"AM":"12:00 AM - 7:00 AM","Business Hours":"8:00 AM - 6:00 PM"}';
 
-test('Delivery-Time is left untouched when no mapping is configured', () => {
+test('Delivery-Time defaults when no mapping is configured and the order has none', () => {
   withWindowTimes(undefined, () => {
-    assert.ok(!('Delivery-Time' in buildOrderAttributes(RESOLVED)));
+    assert.strictEqual(buildOrderAttributes(RESOLVED)['Delivery-Time'], DEFAULT_DELIVERY_TIME);
+  });
+});
+
+test('Delivery-Time already on the order is left untouched when no mapping is configured', () => {
+  withWindowTimes(undefined, () => {
+    assert.ok(
+      !('Delivery-Time' in buildOrderAttributes(RESOLVED, { existingDeliveryTime: '6:00 AM - 6:00 PM' }))
+    );
   });
 });
 
@@ -233,15 +240,23 @@ test('timeRangeForWindow tolerates casing drift between schedule and config', ()
   });
 });
 
-test('an unmapped window leaves Delivery-Time alone rather than blanking it', () => {
+test('an unmapped window defaults Delivery-Time rather than leaving it blank', () => {
   withWindowTimes('{"Evening":"5:00 PM - 9:00 PM"}', () => {
-    assert.ok(!('Delivery-Time' in buildOrderAttributes(RESOLVED)));
+    assert.strictEqual(buildOrderAttributes(RESOLVED)['Delivery-Time'], DEFAULT_DELIVERY_TIME);
+  });
+});
+
+test('an unmapped window still leaves an existing Delivery-Time alone', () => {
+  withWindowTimes('{"Evening":"5:00 PM - 9:00 PM"}', () => {
+    assert.ok(
+      !('Delivery-Time' in buildOrderAttributes(RESOLVED, { existingDeliveryTime: '6:00 AM - 6:00 PM' }))
+    );
   });
 });
 
 test('invalid DELIVERY_WINDOW_TIMES fails safe instead of throwing', () => {
   withWindowTimes('{not json', () => {
-    assert.ok(!('Delivery-Time' in buildOrderAttributes(RESOLVED)));
+    assert.strictEqual(buildOrderAttributes(RESOLVED)['Delivery-Time'], DEFAULT_DELIVERY_TIME);
   });
 });
 
@@ -733,14 +748,22 @@ test('half a mapping is written rather than discarded', () => {
   });
 });
 
-test('an unusable mapping leaves Delivery-Time alone rather than blanking it', () => {
+test('an unusable mapping still leaves an existing Delivery-Time alone', () => {
   // Writing an empty string would replace a correct customer-visible value with
   // nothing, which is worse than leaving it as it was.
   withWindowTimes('{"AM":{}}', () => {
     assert.strictEqual(timeRangeForWindow('AM'), null);
-    assert.ok(!('Delivery-Time' in buildOrderAttributes(RESOLVED)));
+    assert.ok(
+      !('Delivery-Time' in buildOrderAttributes(RESOLVED, { existingDeliveryTime: '6:00 AM - 6:00 PM' }))
+    );
   });
   withWindowTimes('{"AM":42}', () => {
     assert.strictEqual(timeRangeForWindow('AM'), null);
+  });
+});
+
+test('an unusable mapping still defaults Delivery-Time for an order with none', () => {
+  withWindowTimes('{"AM":{}}', () => {
+    assert.strictEqual(buildOrderAttributes(RESOLVED)['Delivery-Time'], DEFAULT_DELIVERY_TIME);
   });
 });

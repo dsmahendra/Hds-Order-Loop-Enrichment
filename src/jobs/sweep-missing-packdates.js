@@ -60,6 +60,14 @@ function needsWork(order) {
     const missing = missingTags(order, null);
     if (missing.length) return { plan, why: `missing tag(s) ${missing.join(', ')}` };
   }
+
+  // Same reasoning for Delivery-Time: complete dates don't imply it was ever
+  // set, since HDS_FIELDS deliberately excludes it. applyHdsToOrder fills the
+  // default itself once it sees 'tags-only' — this only decides whether that
+  // call is worth making.
+  if (!getNoteAttribute(order, 'Delivery-Time')) {
+    return { plan, why: 'missing Delivery-Time' };
+  }
   return null;
 }
 

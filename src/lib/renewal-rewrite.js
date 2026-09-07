@@ -166,6 +166,16 @@ function deliveryTimeFormat() {
   return raw && raw.trim() ? raw : '{time}';
 }
 
+// The hard fallback for an order that has NEVER carried a Delivery-Time — not
+// merely unmapped by DELIVERY_WINDOW_TIMES. HDS is now the only source of the
+// dates (Zapiet/Arigato are disabled), and a blank Delivery-Time was reaching
+// the kitchen because both windowTimes() and the checkout extension could
+// leave it unset. "Daytime" (8 AM - 6 PM) is the widest window HDS offers, so
+// it is the safe guess when nothing else is known. Only ever used to fill a
+// GAP: see deliveryTimeFor() below, which never overwrites a value the
+// customer actually chose.
+const DEFAULT_DELIVERY_TIME = process.env.DELIVERY_TIME_DEFAULT || '8:00 AM - 6:00 PM';
+
 function timeRangeForWindow(window) {
   const entry = windowEntryFor(window);
   if (!entry) return null;
@@ -188,16 +198,19 @@ function timeRangeForWindow(window) {
 // Checkout-Method, Custom-Attribute-*, _amp_sc, sp_*. Those come from checkout or
 // other apps — HDS has no authority over them, and the write merges rather than
 // replaces so they survive untouched.
-function buildOrderAttributes(resolved, { preferredWindow = null } = {}) {
+function buildOrderAttributes(resolved, { preferredWindow = null, existingDeliveryTime = null } = {}) {
   const cutoff = resolved.cutoff_override || cutoffFor(resolved.option);
   const window = chooseDeliveryWindow(resolved, preferredWindow);
+  // The mapped range when DELIVERY_WINDOW_TIMES covers this window; otherwise
+  // the fixed default, but only for an order with no Delivery-Time of its own —
+  // one the customer actually chose is never replaced by a guess.
+  const deliveryTime = timeRangeForWindow(window) || (existingDeliveryTime ? null : DEFAULT_DELIVERY_TIME);
 
   const out = {
     // What the downstream integration reads.
     'Delivery-Date': toSlashDate(resolved.delivery_date),
     'Pick-Pack-Date': toSlashDate(resolved.pack_date),
-    // Only when DELIVERY_WINDOW_TIMES maps this window; otherwise left untouched.
-    'Delivery-Time': timeRangeForWindow(window),
+    'Delivery-Time': deliveryTime,
     // The labelled HDS set, as the checkout extension writes it.
     'HDS Delivery Date': toSlashDate(resolved.delivery_date),
     'HDS Delivery Formatted': resolved.formatted_date,
@@ -610,6 +623,7 @@ async function rewriteRenewalOrder(order, { dryRun = false, subscriptionAttribut
 
   const attributes = buildOrderAttributes(resolved, {
     preferredWindow: getNoteAttribute(order, 'HDS Delivery Window'),
+    existingDeliveryTime: getNoteAttribute(order, 'Delivery-Time'),
   });
   const tag = packDateTag(resolved.pack_date);
   const dateTag = deliveryDateTag(resolved.delivery_date);
@@ -658,6 +672,7 @@ module.exports = {
   scheduleFor,
   weekdayOf,
   timeRangeForWindow,
+  DEFAULT_DELIVERY_TIME,
   rewriteRenewalOrder,
   buildOrderAttributes,
   packDateTag,
@@ -809,6 +824,7 @@ async function fillHdsRecords(order, { dryRun = false, overwrite = false } = {})
 
     const built = buildOrderAttributes(resolved, {
       preferredWindow: getNoteAttribute(order, 'HDS Delivery Window'),
+      existingDeliveryTime: getNoteAttribute(order, 'Delivery-Time'),
     });
 
     const scope = fillScope();

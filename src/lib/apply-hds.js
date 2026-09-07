@@ -23,6 +23,7 @@ const {
   rewriteRenewalOrder,
   fillHdsRecords,
   pendingHdsFields,
+  DEFAULT_DELIVERY_TIME,
 } = require('./renewal-rewrite');
 const { missingTags, taggingEnabled } = require('./order-tags');
 const { subscriptionContextForOrder } = require('../loop');
@@ -118,6 +119,22 @@ async function applyHdsToOrder(
       if (!dryRun) await updateOrderAttributes(orderId, { addTags: missing, order });
       result.tagsAdded = missing;
     }
+  }
+
+  // --- delivery time ---------------------------------------------------------
+  // A rewrite or fill above already resolved Delivery-Time (see
+  // buildOrderAttributes). An order whose dates were already complete never
+  // goes through that path, so an order that still has no Delivery-Time needs
+  // it added directly here — no HDS call needed, since the default is a fixed
+  // clock range rather than anything derived from the schedule.
+  if (plan.action === 'tags-only' && !getNoteAttribute(order, 'Delivery-Time')) {
+    if (!dryRun) {
+      await updateOrderAttributes(orderId, {
+        attributes: { 'Delivery-Time': DEFAULT_DELIVERY_TIME },
+        order,
+      });
+    }
+    result.deliveryTimeAdded = DEFAULT_DELIVERY_TIME;
   }
 
   return { ...result, ok: true, dryRun };
