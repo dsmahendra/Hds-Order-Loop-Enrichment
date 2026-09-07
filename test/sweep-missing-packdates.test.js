@@ -24,6 +24,7 @@ const COMPLETE_HDS = {
   'HDS Delivery Formatted': 'Monday, 7 September 2026',
   'HDS Delivery Day': 'Monday',
   'HDS Delivery Window': 'AM',
+  'Delivery-Time': '12:00 AM - 7:00 AM',
   'HDS Schedule ID': '12',
   'HDS Cutoff Day': 'Friday',
   'HDS Cutoff Date': '2026/09/04',
@@ -82,6 +83,19 @@ test('complete dates but missing tags is caught, without asking Loop', () => {
   assert.strictEqual(work.plan.action, 'tags-only');
   assert.match(work.why, /missing tag/);
   assert.match(work.why, /Pick-Pack-Date-06-09-2026/);
+});
+
+test('complete dates and tags but missing Delivery-Time is caught', () => {
+  // Delivery-Time is deliberately outside HDS_FIELDS (see HDS_FIELDS docs), so
+  // this order's dates alone don't tell needsWork it needs anything — the
+  // Delivery-Time check has to be its own path.
+  const withoutTime = { ...COMPLETE_HDS };
+  delete withoutTime['Delivery-Time'];
+
+  const work = needsWork(orderWith({ note_attributes: attrs(withoutTime) }));
+  assert.ok(work, 'must not be judged complete');
+  assert.strictEqual(work.plan.action, 'tags-only');
+  assert.match(work.why, /Delivery-Time/);
 });
 
 test('a partially tagged order is caught on the tag it lacks', () => {

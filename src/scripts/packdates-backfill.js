@@ -126,11 +126,16 @@ async function main() {
 
       const label = `${order.name || order.id} (${String(order.created_at).slice(0, 10)})`;
 
-      // Already has a pack date and nothing pending — leave it entirely alone.
-      // With --recompute nothing counts as already done: the point is to replace
-      // values that are present but wrong.
+      // Already has a pack date, a Delivery-Time, and nothing pending — leave it
+      // entirely alone. With --recompute nothing counts as already done: the
+      // point is to replace values that are present but wrong.
       const plan = planFor(order);
-      if (!opts.recompute && packDateOf(order) && plan.action === 'tags-only') {
+      if (
+        !opts.recompute &&
+        packDateOf(order) &&
+        getNoteAttribute(order, 'Delivery-Time') &&
+        plan.action === 'tags-only'
+      ) {
         alreadyOk += 1;
         continue;
       }
@@ -162,7 +167,8 @@ async function main() {
         const changed = before && pack !== before ? ` (was ${before})` : '';
         console.log(
           `  ${opts.dryRun ? 'WOULD  ' : 'FIXED  '} ${label}: ${out.action}, pack ${pack}${changed}` +
-            (out.tagsAdded.length ? `, tags ${out.tagsAdded.join(', ')}` : '')
+            (out.tagsAdded.length ? `, tags ${out.tagsAdded.join(', ')}` : '') +
+            (out.deliveryTimeAdded ? `, Delivery-Time ${out.deliveryTimeAdded} (defaulted)` : '')
         );
 
         if (!opts.dryRun) await sleep(WRITE_GAP_MS);

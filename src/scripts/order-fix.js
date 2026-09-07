@@ -115,9 +115,10 @@ async function runOne(orderId, opts) {
     for (const [k, v] of Object.entries(out.wrote)) console.log(`     ${k.padEnd(24)} ${v}`);
   }
   if (out.tagsAdded.length) console.log(`  tags           : ${out.tagsAdded.join(', ')}`);
+  if (out.deliveryTimeAdded) console.log(`  Delivery-Time  : ${out.deliveryTimeAdded} (defaulted — order had none)`);
 
-  if (!out.wrote && !out.tagsAdded.length) {
-    console.log('  nothing to do — dates and tags are all present');
+  if (!out.wrote && !out.tagsAdded.length && !out.deliveryTimeAdded) {
+    console.log('  nothing to do — dates, tags and Delivery-Time are all present');
     return { skipped: true };
   }
 

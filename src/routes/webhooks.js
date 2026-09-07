@@ -20,6 +20,8 @@ const {
   hasHdsRecords,
   fillHdsRecords,
   pendingHdsFields,
+  DEFAULT_DELIVERY_TIME,
+  selectionMode,
 } = require('../lib/renewal-rewrite');
 const { missingTags, taggingEnabled, hasSellingPlan } = require('../lib/order-tags');
 const { buildHdsAttributes } = require('../lib/renewal-date');
@@ -144,6 +146,7 @@ router.post('/shopify/orders/create', async (req, res) => {
   // the renewals seen so far.
   let rewritten = false;
   let rewriteFailed = false;
+  let filled = false;
 
   // Did this order end up with the HDS data it needs?
   //
@@ -188,18 +191,28 @@ router.post('/shopify/orders/create', async (req, res) => {
       previousDeliveryDate = state.current || null;
 
       // Best effort: the subscription's own Delivery-Date is the authoritative
-      // weekday, but Loop may not have ingested this order yet. Falling back to
-      // the order's own attributes is fine — it is what we used before.
+      // weekday, but only 'keep-weekday' mode actually needs it — 'cutoff-day'
+      // (the default) and 'earliest' match the schedule off the ORDER's own
+      // creation weekday instead, so this Loop round trip bought nothing there
+      // except latency before the write, and Loop may not have ingested the
+      // order yet regardless. Skipped unless the mode requires it: the tags
+      // block further down still fetches the subscription once it actually
+      // wants it, AFTER Pick-Pack-Date/Delivery-Time have already landed on the
+      // order — which matters because at least one downstream integration
+      // (NetSuite) reads the order exactly once, at creation, and never
+      // revisits it, so whatever isn't on the order by then is missed for good.
       let subscriptionAttributes = null;
-      try {
-        const context = await subscriptionContextForOrder(orderId);
-        subscriptionContext = context;
-        subscriptionAttributes = context?.attributes || null;
-        if (context) loopSubscriptionIdEarly = context.subscriptionId;
-      } catch (err) {
-        console.warn(
-          `[webhook] order ${orderId}: could not read the subscription for its delivery day — ${describeError(err)}`
-        );
+      if (selectionMode() === 'keep-weekday') {
+        try {
+          const context = await subscriptionContextForOrder(orderId);
+          subscriptionContext = context;
+          subscriptionAttributes = context?.attributes || null;
+          if (context) loopSubscriptionIdEarly = context.subscriptionId;
+        } catch (err) {
+          console.warn(
+            `[webhook] order ${orderId}: could not read the subscription for its delivery day — ${describeError(err)}`
+          );
+        }
       }
       try {
         const out = await rewriteRenewalOrder(order, { subscriptionAttributes });
@@ -288,6 +301,7 @@ router.post('/shopify/orders/create', async (req, res) => {
           hdsWriteOk = false;
           console.warn(`[webhook] order ${orderId}: could not fill HDS records — ${out.reason}`);
         } else {
+          filled = true;
           const r = out.resolved;
           effectiveDeliveryDate = r.delivery_date;
           effectiveSuburb = r.suburb || effectiveSuburb;
@@ -343,6 +357,25 @@ router.post('/shopify/orders/create', async (req, res) => {
         hdsWriteOk = false;
         console.warn(`[webhook] order ${orderId}: could not add tags — ${describeError(err)}`);
       }
+    }
+  }
+
+  // Delivery-Time is deliberately excluded from the HDS field set (it belongs to
+  // checkout/whatever scheduled the order), so an order whose dates were already
+  // complete never gets one from the rewrite or fill above. A rewritten or filled
+  // order already carries it — buildOrderAttributes resolves it as part of that
+  // write — so only the untouched case needs it added directly. No HDS call
+  // needed: the default is a fixed clock range, not something derived from the
+  // schedule.
+  if (!rewritten && !filled && !getNoteAttribute(order, 'Delivery-Time')) {
+    try {
+      await updateOrderAttributes(orderId, {
+        attributes: { 'Delivery-Time': DEFAULT_DELIVERY_TIME },
+        order,
+      });
+      console.log(`[webhook] order ${orderId}: Delivery-Time defaulted to ${DEFAULT_DELIVERY_TIME}`);
+    } catch (err) {
+      console.warn(`[webhook] order ${orderId}: could not default Delivery-Time — ${describeError(err)}`);
     }
   }
 
