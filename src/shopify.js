@@ -251,6 +251,17 @@ function getOrder(orderId) {
   return shopifyRequest('GET', `/orders/${orderId}.json`);
 }
 
+// Look an order up by its display name ("WM141907") instead of its numeric id —
+// what a person actually has in hand from the order page or a spreadsheet.
+// status=any for the same reason as listOrders: a fulfilled/cancelled order must
+// still be found. Returns null rather than throwing when nothing matches, so a
+// typo'd name reads as "not found" instead of a crash.
+async function getOrderByName(name) {
+  const params = new URLSearchParams({ name: String(name), status: 'any' });
+  const data = await shopifyRequest('GET', `/orders.json?${params.toString()}`);
+  return data?.orders?.[0] || null;
+}
+
 // Merge updates into an order's existing note_attributes.
 //
 // The Admin API REPLACES note_attributes wholesale, so sending only our keys
@@ -338,6 +349,7 @@ module.exports = {
   writeEnrichmentMetafield,
   shopifyRequest,
   getOrder,
+  getOrderByName,
   updateOrderAttributes,
   mergeNoteAttributes,
   mergeTags,

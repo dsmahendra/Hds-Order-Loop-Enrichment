@@ -4,11 +4,19 @@
 //   node src/scripts/order-fix.js --order 8219641675874 --dry-run
 //   node src/scripts/order-fix.js --order 8219641675874
 //   node src/scripts/order-fix.js --order 1 --order 2 --force
+//   node src/scripts/order-fix.js --name WM141937 --name WM141926
+//   node src/scripts/order-fix.js --name WM141907 --name WM141921 --recompute
 //
 // Flags
 //   --order <id>   Shopify order id. Repeatable.
+//   --name <name>  Shopify order name, e.g. WM141907 (looked up for you).
+//                  Repeatable, and freely mixable with --order.
 //   --dry-run      Resolve and print the before/after, write nothing.
 //   --force        Rewrite even when the current Delivery-Date looks valid.
+//   --recompute    Keep the existing Delivery-Date but REPLACE everything
+//                  derived from it (Pick-Pack-Date included) with a fresh HDS
+//                  lookup. For an order whose pack date is simply WRONG, where
+//                  --force would needlessly also risk moving the delivery date.
 //   --allow-rewrite Permit a date-replacing rewrite on a deployment where
 //                  REWRITE_RENEWAL_DATES=false. Without it, such a run is refused
 //                  and falls back to adding only what is missing.
@@ -18,22 +26,24 @@
 // Needs SHOPIFY_STORE + SHOPIFY_ADMIN_TOKEN (write_orders) and HDS_API_BASE.
 
 require('dotenv').config();
-const { getOrder, getNoteAttribute, describeAdminToken } = require('../shopify');
+const { getOrder, getOrderByName, getNoteAttribute, describeAdminToken } = require('../shopify');
 const { resolveAdminToken } = require('../shopify-tokens');
 const { needsRewrite, locationFor } = require('../lib/renewal-rewrite');
 const { applyHdsToOrder, planFor, rewriteEnabled, hasDeliveryDate } = require('../lib/apply-hds');
 const { buildHdsAttributes } = require('../lib/renewal-date');
 
 function parseArgs(argv) {
-  const opts = { orders: [] };
+  const opts = { refs: [] };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
-    if (a === '--order') opts.orders.push(argv[++i]);
+    if (a === '--order') opts.refs.push({ id: argv[++i] });
+    else if (a === '--name') opts.refs.push({ name: argv[++i] });
     else if (a === '--dry-run') opts.dryRun = true;
     else if (a === '--force') opts.force = true;
+    else if (a === '--recompute') opts.recompute = true;
     else if (a === '--allow-rewrite') opts.allowRewrite = true;
     else if (a === '--no-requeue') opts.noRequeue = true;
-    else if (!a.startsWith('--')) opts.orders.push(a);
+    else if (!a.startsWith('--')) opts.refs.push({ id: a });
     else throw new Error(`unknown flag ${a}`);
   }
   return opts;
@@ -64,10 +74,11 @@ async function requeue(orderId, resolved, attributes) {
   return rowCount;
 }
 
-async function runOne(orderId, opts) {
-  const res = await getOrder(orderId);
-  const order = res?.order;
-  if (!order) throw new Error(`order ${orderId} not found in Shopify`);
+async function runOne(ref, opts) {
+  const label = ref.id || ref.name;
+  const order = ref.id ? (await getOrder(ref.id))?.order : await getOrderByName(ref.name);
+  if (!order) throw new Error(`order ${label} not found in Shopify`);
+  const orderId = order.id;
 
   const { postcode, suburb } = locationFor(order);
   const state = needsRewrite(order);
@@ -106,6 +117,7 @@ async function runOne(orderId, opts) {
     dryRun: opts.dryRun,
     atCreation: false,
     force: opts.force,
+    recompute: opts.recompute,
   });
 
   if (!out.ok) throw new Error(out.reason);
@@ -138,8 +150,10 @@ async function runOne(orderId, opts) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
-  if (!opts.orders.length) {
-    console.error('Usage: node src/scripts/order-fix.js --order <shopifyOrderId> [--dry-run] [--force]');
+  if (!opts.refs.length) {
+    console.error(
+      'Usage: node src/scripts/order-fix.js (--order <shopifyOrderId> | --name <orderName>) [--dry-run] [--force | --recompute]'
+    );
     process.exitCode = 1;
     return;
   }
@@ -157,17 +171,17 @@ async function main() {
 
   let ok = 0;
   const failures = [];
-  for (const orderId of opts.orders) {
+  for (const ref of opts.refs) {
     try {
-      await runOne(orderId, opts);
+      await runOne(ref, opts);
       ok += 1;
     } catch (err) {
-      failures.push(`${orderId}: ${err.message}`);
+      failures.push(`${ref.id || ref.name}: ${err.message}`);
       console.error(`  ✗ ${err.message}`);
     }
   }
 
-  console.log(`\nDone: ${ok} handled, ${failures.length} failed (of ${opts.orders.length}).`);
+  console.log(`\nDone: ${ok} handled, ${failures.length} failed (of ${opts.refs.length}).`);
   if (failures.length) process.exitCode = 1;
 }
 
