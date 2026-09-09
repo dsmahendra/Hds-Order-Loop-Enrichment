@@ -105,7 +105,11 @@ test('a Friday cutoff selects the schedule that ships Sunday and delivers Monday
   assert.equal(result.ok, true);
   assert.equal(result.data.delivery_date, '2026-08-31'); // Monday
   assert.equal(result.data.pack_date, '2026-08-30'); // Sunday
-  assert.match(result.data.matched_by, /Friday cutoff schedule 1 \(Monday delivery, computed from the order date\)/);
+  // Not pinned to "computed from the order date": once the fixture's charge
+  // date (2026-08-28) is far enough in the past, the pack-date staleness guard
+  // prefers the schedule's own already-actionable date instead — same values
+  // either way here, just a different explanation of how they were reached.
+  assert.match(result.data.matched_by, /Friday cutoff schedule 1 \(Monday delivery/);
   assert.equal(result.data.cutoff_day, 'Friday');
 });
 
@@ -135,6 +139,81 @@ test('a weekday with no cutoff in the region falls back rather than failing', as
   assert.equal(result.ok, true);
   assert.match(result.data.matched_by, /no Saturday cutoff in this region/);
   assert.equal(result.data.delivery_date, '2026-08-30'); // the soonest on offer
+});
+
+// --- pack-date staleness guard ------------------------------------------------
+// Recomputing "next occurrence on/after the order date" from an order that is
+// itself old (a backfill reaching a renewal well after it arrived) can land on
+// a pack date that has ALSO already gone by. The guard prefers the schedule's
+// own already-actionable date instead. daysFromNow keeps this independent of
+// whenever the suite actually runs.
+function daysFromNow(n) {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+test('a genuinely old order date does not recompute into an already-passed pack date', async () => {
+  const freshOption = {
+    schedule_id: 42,
+    delivery_day: 'Monday',
+    delivery_date: daysFromNow(5),
+    pack_date: daysFromNow(3),
+    production_date: daysFromNow(2),
+    cutoff_info: 'Friday 11 PM',
+  };
+  const originalFetch = global.fetch;
+  global.fetch = stubOptions([freshOption]);
+  try {
+    const result = await resolveRenewalDelivery({
+      postcode: '2170',
+      suburb: 'Prestons',
+      chargeDateIso: `${daysFromNow(-30)}T09:00:00+10:00`,
+      cutoffDay: 'Friday',
+    });
+
+    assert.equal(result.ok, true);
+    // HDS's own already-actionable date, not a recompute from a 30-day-old
+    // reference that would itself already have passed.
+    assert.equal(result.data.delivery_date, freshOption.delivery_date);
+    assert.equal(result.data.pack_date, freshOption.pack_date);
+    assert.match(result.data.matched_by, /already gone|next available/);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('a recent order date still recomputes normally when the result is not stale', async () => {
+  // The guard only skips the recompute when it WOULD be stale — a renewal
+  // processed promptly, close to its own charge date, keeps working exactly as
+  // before. packGap 0 (pack_date == delivery_date) keeps this deterministic
+  // regardless of which real weekday the suite happens to run on: the
+  // recompute's earliest possible result is chargeDate + 1 day, so with no gap
+  // to subtract it can never land on or before today.
+  const recentCharge = daysFromNow(0);
+  const freshOption = {
+    schedule_id: 42,
+    delivery_day: 'Monday',
+    delivery_date: daysFromNow(20),
+    pack_date: daysFromNow(20),
+    production_date: daysFromNow(19),
+    cutoff_info: 'Friday 11 PM',
+  };
+  const originalFetch = global.fetch;
+  global.fetch = stubOptions([freshOption]);
+  try {
+    const result = await resolveRenewalDelivery({
+      postcode: '2170',
+      suburb: 'Prestons',
+      chargeDateIso: `${recentCharge}T09:00:00+10:00`,
+      cutoffDay: 'Friday',
+    });
+
+    assert.equal(result.ok, true);
+    assert.match(result.data.matched_by, /computed from the order date/);
+  } finally {
+    global.fetch = originalFetch;
+  }
 });
 
 test('cutoff-day selection ignores the delivery weekday entirely', async () => {

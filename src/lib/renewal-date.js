@@ -280,14 +280,29 @@ async function resolveRenewalDelivery({
       inclusive: false, // a cutoff day is never its own delivery day
     });
 
-    if (next.ok) {
+    const recomputedPack = next.ok && packGap != null ? subtractDays(next.delivery_date, packGap) : null;
+
+    // chargeDate is the ORDER's own date, which is old on a backfill reaching a
+    // renewal well after it arrived — computing "next occurrence on or after"
+    // from an old reference lands on an equally old, already-passed pack date.
+    // chosen is HDS's own already-actionable answer for this schedule (dates
+    // stays defaulted to it above), so a stale recompute is simply skipped
+    // rather than used, in preference of what's already correct.
+    const todayIso = new Date().toISOString().slice(0, 10);
+    const recomputeIsStale = recomputedPack && recomputedPack <= todayIso;
+
+    if (next.ok && !recomputeIsStale) {
       dates = {
         delivery_date: next.delivery_date,
-        pack_date: packGap == null ? null : subtractDays(next.delivery_date, packGap),
+        pack_date: recomputedPack,
         production_date: productionGap == null ? null : subtractDays(next.delivery_date, productionGap),
         formatted_date: formatLongDate(next.delivery_date),
       };
       matchedBy = `${cutoffDay} cutoff schedule ${chosen.schedule_id} (${chosen.delivery_day} delivery, computed from the order date)`;
+    } else if (recomputeIsStale) {
+      matchedBy =
+        `${cutoffDay} cutoff schedule ${chosen.schedule_id} (${chosen.delivery_day} delivery — ` +
+        `computing from the order date would give pack ${recomputedPack}, already gone; next available used instead)`;
     }
   }
 

@@ -580,7 +580,8 @@ test('mergeTags does not duplicate a tag that is already present', () => {
 // The additive default protects what is on the order, which is exactly wrong when
 // the thing on the order is the mistake being corrected.
 
-const { fillHdsRecords } = require('../src/lib/renewal-rewrite');
+const { fillHdsRecords, weekdayOf: weekdayOfDate } = require('../src/lib/renewal-rewrite');
+const { clearDeliveryOptionsCache } = require('../src/lib/renewal-date');
 
 const stubHds = (options) => async () => ({
   ok: true,
@@ -593,15 +594,37 @@ const stubHds = (options) => async () => ({
   }),
 });
 
+// Computed relative to whenever the suite actually runs, not a fixed 2026
+// literal: fillHdsRecords now rejects a derived pack date that is on or before
+// TODAY (see the staleness guard), so a fixture has to stay in the future
+// forever rather than merely at the time it was written.
+function minusDays(iso, days) {
+  const d = new Date(`${iso}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() - days);
+  return d.toISOString().slice(0, 10);
+}
+function fridayAtLeastDaysAhead(days) {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() + days);
+  const FRIDAY = 5;
+  d.setUTCDate(d.getUTCDate() + ((FRIDAY - d.getUTCDay() + 7) % 7));
+  return d.toISOString().slice(0, 10);
+}
+const slash = (iso) => iso.replace(/-/g, '/');
+
+const FUTURE_FRIDAY = fridayAtLeastDaysAhead(60);
+const FUTURE_PACK = minusDays(FUTURE_FRIDAY, 2);
+const FUTURE_PRODUCTION = minusDays(FUTURE_FRIDAY, 3);
+
 const FRIDAY_SCHEDULE = [
   {
     schedule_id: 154,
     delivery_day: 'Friday',
     delivery_window: 'AM,Business Hours',
     cutoff_info: 'Monday 11 PM',
-    delivery_date: '2026-09-11',
-    pack_date: '2026-09-09',
-    production_date: '2026-09-08',
+    delivery_date: FUTURE_FRIDAY,
+    pack_date: FUTURE_PACK,
+    production_date: FUTURE_PRODUCTION,
   },
 ];
 
@@ -609,20 +632,21 @@ const HAND_ENTERED = {
   id: 1,
   created_at: '2026-09-03T22:50:00+10:00',
   shipping_address: { city: 'Carrum', zip: '3197' },
-  ...attrs({ 'Delivery-Date': '2026/09/11', 'Pick-Pack-Date': '2026/09/05' }),
+  ...attrs({ 'Delivery-Date': slash(FUTURE_FRIDAY), 'Pick-Pack-Date': '2026/09/05' }),
 };
 
 test('overwrite replaces a pack date that was set by hand', async () => {
   const originalFetch = global.fetch;
+  clearDeliveryOptionsCache();
   global.fetch = stubHds(FRIDAY_SCHEDULE);
   try {
     const out = await fillHdsRecords(HAND_ENTERED, { dryRun: true, overwrite: true });
 
     assert.equal(out.ok, true);
     // The schedule's own two-day gap, not the 2026/09/05 that was there.
-    assert.equal(out.attributes['Pick-Pack-Date'], '2026/09/09');
+    assert.equal(out.attributes['Pick-Pack-Date'], slash(FUTURE_PACK));
     // The delivery date it was computed around is unchanged.
-    assert.equal(out.attributes['Delivery-Date'], '2026/09/11');
+    assert.equal(out.attributes['Delivery-Date'], slash(FUTURE_FRIDAY));
   } finally {
     global.fetch = originalFetch;
   }
@@ -630,6 +654,7 @@ test('overwrite replaces a pack date that was set by hand', async () => {
 
 test('without overwrite the wrong pack date is left exactly as it was', async () => {
   const originalFetch = global.fetch;
+  clearDeliveryOptionsCache();
   global.fetch = stubHds(FRIDAY_SCHEDULE);
   try {
     const out = await fillHdsRecords(HAND_ENTERED, { dryRun: true });
@@ -639,6 +664,126 @@ test('without overwrite the wrong pack date is left exactly as it was', async ()
       !('Pick-Pack-Date' in out.attributes),
       'the existing value is protected, which is the default for a reason'
     );
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('a still-future kept date is left alone (Delivery-Date untouched, additive)', async () => {
+  // The overwrite tests above exercise fillHdsRecords with overwrite:true; this
+  // confirms the ordinary additive path also leaves a good Delivery-Date as it
+  // is, since the staleness guard below changes that specifically when it fires.
+  const order = {
+    id: 4,
+    created_at: '2026-09-03T22:50:00+10:00',
+    shipping_address: { city: 'Carrum', zip: '3197' },
+    ...attrs({ 'Delivery-Date': slash(FUTURE_FRIDAY) }),
+  };
+  const originalFetch = global.fetch;
+  clearDeliveryOptionsCache();
+  global.fetch = stubHds(FRIDAY_SCHEDULE);
+  try {
+    const out = await fillHdsRecords(order, { dryRun: true });
+    assert.equal(out.ok, true, out.reason);
+    assert.ok(!('Delivery-Date' in out.attributes), 'a still-valid kept date is not rewritten');
+    assert.equal(out.attributes['Pick-Pack-Date'], slash(FUTURE_PACK));
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+// --- pack-date staleness guard ------------------------------------------------
+// A kept Delivery-Date that has already gone by would derive a pack date that
+// has ALSO already gone by — useless to the kitchen. This is what happens when
+// fillHdsRecords reaches an order well after it arrived: a backfill, a delayed
+// retry, an old order surfaced from a spreadsheet days or weeks later.
+
+function daysFromNow(n) {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+test('a kept date whose derived pack date has already passed is replaced with the next available one', async () => {
+  const staleDelivery = daysFromNow(-3);
+  const wanted = weekdayOfDate(staleDelivery);
+  const freshDelivery = daysFromNow(10);
+  const freshPack = daysFromNow(8);
+  const freshProduction = daysFromNow(7);
+
+  const schedule = [
+    {
+      schedule_id: 999,
+      delivery_day: wanted,
+      delivery_window: 'AM',
+      cutoff_info: 'Monday 11 PM',
+      delivery_date: freshDelivery,
+      pack_date: freshPack,
+      production_date: freshProduction,
+    },
+  ];
+
+  const order = {
+    id: 5,
+    created_at: `${daysFromNow(-10)}T09:00:00+10:00`,
+    shipping_address: { city: 'Carrum', zip: '3197' },
+    ...attrs({ 'Delivery-Date': slash(staleDelivery) }),
+  };
+
+  const originalFetch = global.fetch;
+  clearDeliveryOptionsCache();
+  global.fetch = stubHds(schedule);
+  try {
+    const out = await fillHdsRecords(order, { dryRun: true });
+
+    assert.equal(out.ok, true, out.reason);
+    // Additive mode still corrects the stale kept date, or Pick-Pack-Date would
+    // describe a cycle Delivery-Date doesn't show.
+    assert.equal(out.attributes['Delivery-Date'], slash(freshDelivery));
+    assert.equal(out.attributes['Pick-Pack-Date'], slash(freshPack));
+    assert.equal(out.resolved.production_date, freshProduction);
+    assert.match(out.resolved.matched_by, /already gone|next available/);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('an order missing entirely by the time it is processed also gets the next available date', async () => {
+  // Same guard, exercised through --overwrite: a pack date typed in by hand
+  // that has since passed must not survive just because overwrite was asked for.
+  const staleDelivery = daysFromNow(-1);
+  const wanted = weekdayOfDate(staleDelivery);
+  const freshDelivery = daysFromNow(6);
+  const freshPack = daysFromNow(4);
+
+  const schedule = [
+    {
+      schedule_id: 1000,
+      delivery_day: wanted,
+      delivery_window: 'AM',
+      cutoff_info: 'Monday 11 PM',
+      delivery_date: freshDelivery,
+      pack_date: freshPack,
+      production_date: daysFromNow(3),
+    },
+  ];
+
+  const order = {
+    id: 6,
+    created_at: `${daysFromNow(-8)}T09:00:00+10:00`,
+    shipping_address: { city: 'Carrum', zip: '3197' },
+    ...attrs({ 'Delivery-Date': slash(staleDelivery), 'Pick-Pack-Date': slash(daysFromNow(-3)) }),
+  };
+
+  const originalFetch = global.fetch;
+  clearDeliveryOptionsCache();
+  global.fetch = stubHds(schedule);
+  try {
+    const out = await fillHdsRecords(order, { dryRun: true, overwrite: true });
+
+    assert.equal(out.ok, true, out.reason);
+    assert.equal(out.attributes['Delivery-Date'], slash(freshDelivery));
+    assert.equal(out.attributes['Pick-Pack-Date'], slash(freshPack));
   } finally {
     global.fetch = originalFetch;
   }
