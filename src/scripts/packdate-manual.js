@@ -1,14 +1,22 @@
-// Manually set the pack date on orders placed in a time window.
+// Manually set the pack date on orders placed in a time window, or on an
+// explicit named list.
 //
 //   node src/scripts/packdate-manual.js --from "2026-09-04 3:55 pm" --to "2026-09-04 4:07 pm" --dry-run
 //   node src/scripts/packdate-manual.js --from "2026-09-04 15:55" --to "2026-09-04 16:07" --date 2026/09/05
+//   node src/scripts/packdate-manual.js --name WM141937 --name WM141926 --date 2026/09/11 --overwrite
 //
 // Deliberately standalone. It reads the same helpers the service uses but changes
 // none of them, and nothing in the webhook, the queue or the retry job calls into
 // this file — so running it, or getting it wrong, cannot affect how orders are
 // handled as they arrive.
 //
-// Two modes:
+// Two ways to pick WHICH orders (pick exactly one):
+//
+//   --from/--to     every order created in that store-time window
+//   --name          only the named orders, repeatable — for a specific list off a
+//                   spreadsheet rather than everything from a burst
+//
+// Two ways to pick the DATE:
 //
 //   --date given    write exactly that date to every matched order. A shared
 //                   production run, where one date is correct for all of them.
@@ -23,8 +31,10 @@
 // wrong orders.
 //
 // Flags
-//   --from <when>   start of the window, inclusive
-//   --to <when>     end of the window, inclusive
+//   --from <when>   start of the window, inclusive. Mutually exclusive with --name.
+//   --to <when>     end of the window, inclusive.
+//   --name <name>   an order name, e.g. WM141937. Repeatable. Mutually exclusive
+//                   with --from/--to.
 //   --date <date>   the pack date to write. Omit to compute per order.
 //   --dry-run       report what would change, write nothing
 //   --overwrite     replace a pack date the order already has
@@ -32,18 +42,25 @@
 //                   by default this touches one attribute and nothing else.
 
 require('dotenv').config();
-const { listOrders, getNoteAttribute, updateOrderAttributes, normalizeDate } = require('../shopify');
+const {
+  listOrders,
+  getOrderByName,
+  getNoteAttribute,
+  updateOrderAttributes,
+  normalizeDate,
+} = require('../shopify');
 const { fillHdsRecords, packDateTag } = require('../lib/renewal-rewrite');
 
 const WRITE_GAP_MS = Number(process.env.SHOPIFY_WRITE_GAP_MS || 550);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function parseArgs(argv) {
-  const opts = {};
+  const opts = { names: [] };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--from') opts.from = argv[++i];
     else if (a === '--to') opts.to = argv[++i];
+    else if (a === '--name') opts.names.push(argv[++i]);
     else if (a === '--date') opts.date = argv[++i];
     else if (a === '--dry-run') opts.dryRun = true;
     else if (a === '--overwrite') opts.overwrite = true;
@@ -105,22 +122,36 @@ const packDateOf = (order) =>
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
 
-  const from = parseWhen(opts.from);
-  const to = parseWhen(opts.to, { end: true });
+  const byName = opts.names.length > 0;
+  const byWindow = opts.from || opts.to;
 
-  if (!from || !to) {
-    console.error('Usage:');
-    console.error('  --from "2026-09-04 3:55 pm" --to "2026-09-04 4:07 pm" [--date 2026/09/05]');
-    console.error('  --from "2026-09-04 15:55"   --to "2026-09-04 16:07"');
-    if (opts.from && !from) console.error(`\n--from ${opts.from} is not a date/time`);
-    if (opts.to && !to) console.error(`\n--to ${opts.to} is not a date/time`);
+  if (byName && byWindow) {
+    console.error('--name cannot be combined with --from/--to — pick one way to select orders.');
     process.exitCode = 1;
     return;
   }
-  if (from > to) {
-    console.error(`--from ${from} is after --to ${to}`);
-    process.exitCode = 1;
-    return;
+
+  let from = null;
+  let to = null;
+  if (!byName) {
+    from = parseWhen(opts.from);
+    to = parseWhen(opts.to, { end: true });
+
+    if (!from || !to) {
+      console.error('Usage:');
+      console.error('  --from "2026-09-04 3:55 pm" --to "2026-09-04 4:07 pm" [--date 2026/09/05]');
+      console.error('  --from "2026-09-04 15:55"   --to "2026-09-04 16:07"');
+      console.error('  --name WM141937 --name WM141926 --date 2026/09/11');
+      if (opts.from && !from) console.error(`\n--from ${opts.from} is not a date/time`);
+      if (opts.to && !to) console.error(`\n--to ${opts.to} is not a date/time`);
+      process.exitCode = 1;
+      return;
+    }
+    if (from > to) {
+      console.error(`--from ${from} is after --to ${to}`);
+      process.exitCode = 1;
+      return;
+    }
   }
 
   let packSlash = null;
@@ -135,7 +166,7 @@ async function main() {
   }
 
   console.log('store    :', process.env.SHOPIFY_STORE || 'MISSING');
-  console.log('window   :', `${from} .. ${to}`, '(store time)');
+  console.log('selection:', byName ? `${opts.names.length} named order(s)` : `${from} .. ${to} (store time)`);
   console.log('pack date:', packSlash || 'computed per order from HDS');
   console.log('mode     :', opts.dryRun ? 'DRY RUN (nothing written)' : 'writing');
   console.log('existing :', opts.overwrite ? 'WILL BE REPLACED' : 'left alone');
@@ -147,41 +178,63 @@ async function main() {
   );
   console.log('');
 
-  // The window names its own day, so start the scan there.
-  const since = from.slice(0, 10);
-
-  let pageInfo = null;
   let scanned = 0;
+  let notFound = 0;
   const matched = [];
 
-  do {
-    const res = await listOrders({
-      limit: 250,
-      pageInfo,
-      createdAtMin: pageInfo ? null : since,
-      fields: pageInfo ? null : 'id,name,created_at,tags,note_attributes,shipping_address',
-    });
-    pageInfo = res.pageInfo;
-    if (!res.orders.length) break;
-
-    scanned += res.orders.length;
-    for (const order of res.orders) {
-      if (withinWindow(order, from, to)) matched.push(order);
+  if (byName) {
+    for (const name of opts.names) {
+      scanned += 1;
+      const order = await getOrderByName(name);
+      if (!order) {
+        notFound += 1;
+        console.log(`  NOT FOUND ${name}`);
+        continue;
+      }
+      matched.push(order);
     }
-  } while (pageInfo);
+  } else {
+    // The window names its own day, so start the scan there.
+    const since = from.slice(0, 10);
+    let pageInfo = null;
+
+    do {
+      const res = await listOrders({
+        limit: 250,
+        pageInfo,
+        createdAtMin: pageInfo ? null : since,
+        fields: pageInfo ? null : 'id,name,created_at,tags,note_attributes,shipping_address',
+      });
+      pageInfo = res.pageInfo;
+      if (!res.orders.length) break;
+
+      scanned += res.orders.length;
+      for (const order of res.orders) {
+        if (withinWindow(order, from, to)) matched.push(order);
+      }
+    } while (pageInfo);
+  }
 
   matched.sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
 
-  console.log(`scanned ${scanned} order(s) from ${since}; ${matched.length} inside the window\n`);
+  console.log(
+    byName
+      ? `${matched.length} of ${scanned} named order(s) found\n`
+      : `scanned ${scanned} order(s) from ${from.slice(0, 10)}; ${matched.length} inside the window\n`
+  );
   if (!matched.length) {
-    console.log('Nothing matched. Check the times against the order page — they are store time,');
-    console.log('and the window is inclusive at both ends.');
+    console.log(
+      byName
+        ? 'None of the given names were found — check the spelling against the order page.'
+        : 'Nothing matched. Check the times against the order page — they are store time, and the window is inclusive at both ends.'
+    );
+    if (notFound) process.exitCode = 1;
     return;
   }
 
   let updated = 0;
   let skipped = 0;
-  let failed = 0;
+  let failed = notFound;
   let suspicious = 0;
 
   for (const order of matched) {
