@@ -385,7 +385,13 @@ router.post('/shopify/orders/create', async (req, res) => {
   if (rewriteFailed) {
     try {
       await updateOrderAttributes(orderId, { addTags: [HELD_TAG], order });
-      console.log(`[webhook] order ${orderId}: tagged ${HELD_TAG} — dates left as they arrived`);
+      // One searchable tag across every job (this one, the retry job, the
+      // sweep) is what lets "is anything broken right now" be answered by a
+      // single log search instead of knowing each job's own prefix.
+      console.warn(
+        `[ALERT][webhook] order ${orderId}: tagged ${HELD_TAG} — dates left as they arrived, needs a manual fix ` +
+          `(node src/scripts/order-fix.js --order ${orderId})`
+      );
     } catch (err) {
       console.warn(`[webhook] order ${orderId}: could not tag ${HELD_TAG} — ${describeError(err)}`);
     }

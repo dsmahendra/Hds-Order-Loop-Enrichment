@@ -161,7 +161,11 @@ async function sweep() {
 
       if (!out.ok) {
         failed += 1;
-        console.warn(`[sweep] ${label}: ${out.action} failed — ${out.reason} (was: ${why})`);
+        // [ALERT]: one searchable tag across every job (this one, the retry
+        // job, a held renewal) so "is anything broken right now" is one log
+        // search rather than knowing each job's own prefix. Still logged here
+        // even if the next pass fixes it — this reflects the state RIGHT NOW.
+        console.warn(`[ALERT][sweep] ${label}: ${out.action} failed — ${out.reason} (was: ${why})`);
         continue;
       }
 
@@ -176,7 +180,7 @@ async function sweep() {
     } catch (err) {
       failed += 1;
       const reason = (err.message || String(err)).split('\n')[0];
-      console.warn(`[sweep] ${label}: ${reason}`);
+      console.warn(`[ALERT][sweep] ${label}: ${reason}`);
 
       // Credentials or scopes fail identically for every remaining order, so stop
       // rather than spend the rest of the pass rediscovering that.

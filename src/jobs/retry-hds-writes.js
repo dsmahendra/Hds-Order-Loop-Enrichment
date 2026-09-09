@@ -51,13 +51,26 @@ async function retryOne(row) {
   const out = await applyHdsToOrder(order, { atCreation: false });
 
   if (!out.ok) {
+    const attemptsMade = row.attempts + 1;
     await pool.query(
       `UPDATE orders_to_enrich
           SET attempts = attempts + 1, error_message = $2, updated_at = NOW()
         WHERE order_id = $1`,
       [orderId, `retry: ${out.reason}`]
     );
-    console.warn(`[retry] order ${orderId}: still failing — ${out.reason}`);
+
+    // The last attempt failing means nothing tries this order again on its
+    // own — a single searchable tag across every job (this one, the sweep, a
+    // held renewal) is what lets "is anything broken right now" be answered
+    // by one log search instead of knowing every job's own prefix.
+    if (attemptsMade >= MAX_ATTEMPTS) {
+      console.warn(
+        `[ALERT][retry] order ${orderId}: giving up after ${attemptsMade} attempts — ${out.reason} ` +
+          `(needs a manual fix, e.g. node src/scripts/order-fix.js --order ${orderId})`
+      );
+    } else {
+      console.warn(`[retry] order ${orderId}: still failing (attempt ${attemptsMade}/${MAX_ATTEMPTS}) — ${out.reason}`);
+    }
     return false;
   }
 
