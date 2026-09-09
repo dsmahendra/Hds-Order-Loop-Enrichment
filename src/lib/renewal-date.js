@@ -48,14 +48,18 @@ function addDays(isoDate, days) {
 // Fifty renewals across a dozen suburbs made fifty calls; the same twelve answers
 // would have done.
 //
-// Two things are cached, and the second matters more during a burst:
+// Three things soften a burst; the third matters most for orders across
+// DIFFERENT suburbs, where the first two do nothing:
 //
-//   - a completed answer, for CACHE_TTL_MS
+//   - a completed answer, cached for CACHE_TTL_MS
 //   - the IN-FLIGHT request, so concurrent orders for one suburb share the single
 //     call already on its way rather than each starting another
+//   - pacedHds() below, which queues every outbound call to HDS itself so a
+//     burst across many suburbs goes out steadily rather than all at once
 //
-// The key carries the date because the answer contains dates. The TTL is short
-// for the same reason: a cached answer must not outlive the day it describes.
+// The cache key carries the date because the answer contains dates. The TTL is
+// short for the same reason: a cached answer must not outlive the day it
+// describes.
 const CACHE_TTL_MS = Number(process.env.HDS_CACHE_TTL_MS || 60 * 1000);
 
 // A transient HDS blip used to cost the order its dates outright — the failure
@@ -80,6 +84,42 @@ function clearDeliveryOptionsCache() {
 
 const nap = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// --- pacing every outbound call to HDS ---------------------------------------
+//
+// Shopify and Loop both got a shared throttle after the same failure mode: a
+// burst of orders inside one minute — a Loop renewal run charging several
+// subscriptions together is the textbook case — fires one call per order, all
+// at once, straight from the webhook handler (concurrent Express requests, not
+// this module's own serial queue processor). HDS never got the same
+// treatment: a burst across several different suburbs is still a burst of
+// fully concurrent, unthrottled requests to it. Retrying a failure (below)
+// does not help when every retry's short backoff window is spent contending
+// with the SAME burst rather than waiting it out.
+//
+// One outbound call at a time, at least MIN_GAP_MS apart, queued rather than
+// dropped or raced — indifferent to how many orders arrive together, same
+// trade Shopify's queue already makes.
+const HDS_MIN_GAP_MS = Number(process.env.HDS_MIN_GAP_MS || 300);
+let hdsQueue = Promise.resolve();
+let hdsLastCallAt = 0;
+
+function pacedHds(task) {
+  const run = hdsQueue.then(async () => {
+    const wait = hdsLastCallAt + HDS_MIN_GAP_MS - Date.now();
+    if (wait > 0) await nap(wait);
+    hdsLastCallAt = Date.now();
+    return task();
+  });
+  // The chain has to survive a rejection, or one failed call poisons every
+  // call queued behind it — exactly the Shopify queue's own fix for the same
+  // shape of bug.
+  hdsQueue = run.then(
+    () => {},
+    () => {}
+  );
+  return run;
+}
+
 // One attempt. Returns the same { ok, data } / { ok, reason } shape as before,
 // plus retryable on the failures worth another go.
 async function attemptDeliveryOptions({ postcode, suburb }) {
@@ -90,7 +130,7 @@ async function attemptDeliveryOptions({ postcode, suburb }) {
 
   let res;
   try {
-    res = await fetch(url, { headers: { Accept: 'application/json' } });
+    res = await pacedHds(() => fetch(url, { headers: { Accept: 'application/json' } }));
   } catch (err) {
     return { ok: false, retryable: true, reason: `network error: ${err.message}` };
   }
