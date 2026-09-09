@@ -685,15 +685,19 @@ module.exports = {
 // ---------------------------------------------------------------------------
 // Filling in the HDS records for an order scheduled by something else.
 //
-// Production orders come from Zapiet, not the HDS checkout: they carry
-// Delivery-Date, Delivery-Slot-Id and Delivery-Location-Id, and no HDS * fields
-// at all. Their delivery date is valid and in the future, so needsRewrite()
-// correctly leaves it alone — which meant nothing ever gave the kitchen a pack or
-// production date for them.
+// Some checkout paths (Shop Pay's accelerated checkout among them) skip the HDS
+// checkout extension: the order carries Delivery-Date, Delivery-Slot-Id and
+// Delivery-Location-Id, and no HDS * fields at all. Its delivery date is valid
+// and in the future, so needsRewrite() correctly leaves it alone — which meant
+// nothing ever gave the kitchen a pack or production date for it.
 //
 // So keep the delivery date exactly as it is and derive the rest around it: find
 // the schedule for that suburb whose delivery weekday matches, and apply its own
-// pack and production gaps. Nothing the other app owns is touched.
+// pack and production gaps. Nothing the other app owns is touched — UNLESS that
+// kept date has already gone by (this runs well after the order arrived: a
+// backfill, a delayed retry), in which case deriving a pack date from it would
+// derive one that has ALSO already gone by. See the pack-date staleness guard
+// inside fillHdsRecords below.
 // How much to add to an order that another system scheduled.
 //
 //   pack-date (default)  add Pick-Pack-Date and nothing else
@@ -802,25 +806,57 @@ async function fillHdsRecords(order, { dryRun = false, overwrite = false } = {})
 
     const packGap = daysBetween(option.delivery_date, option.pack_date);
     const productionGap = daysBetween(option.delivery_date, option.production_date);
+    const keptPackDate = packGap == null ? null : subtractDays(deliveryDate, packGap);
 
-    const resolved = {
-      charge_date: String(order.created_at || '').slice(0, 10) || null,
-      matched_by: `${wanted} schedule ${option.schedule_id} (delivery date kept as it was)`,
-      delivery_date: deliveryDate,
-      pack_date: packGap == null ? null : subtractDays(deliveryDate, packGap),
-      production_date: productionGap == null ? null : subtractDays(deliveryDate, productionGap),
-      region: res.data.region?.name || null,
-      suburb: res.data.suburb?.name || candidate.suburb,
-      postcode: res.data.suburb?.postcode || candidate.postcode,
-      schedule_id: option.schedule_id ?? null,
-      delivery_day: option.delivery_day || wanted,
-      delivery_window: option.delivery_window || null,
-      formatted_date: formatLongDate(deliveryDate),
-      option,
-      // The cutoff for THIS delivery date, from the schedule's own cutoff weekday.
-      // Not the order date: these orders are not charged at the HDS cutoff.
-      cutoff_override: cutoffFor({ delivery_date: deliveryDate, cutoff_info: option.cutoff_info }),
-    };
+    // A pack date on or before today is useless to the kitchen — whatever day
+    // this runs on, "today" is the earliest a pack date can mean anything. It
+    // reads this way whenever the kept Delivery-Date has itself already gone
+    // by: this function normally runs promptly after the order arrives, when
+    // that date is still safely in the future, but a backfill or a delayed
+    // retry can reach an order well after its date has passed. HDS's own
+    // options never carry a stale cutoff (see fetchDeliveryOptions), so its
+    // own pack_date for this weekday is guaranteed still actionable — use that,
+    // and the delivery date that goes with it, instead of the one that's gone.
+    const todayIso = new Date().toISOString().slice(0, 10);
+    const packIsStale = Boolean(keptPackDate) && keptPackDate <= todayIso;
+
+    const resolved = packIsStale
+      ? {
+          charge_date: String(order.created_at || '').slice(0, 10) || null,
+          matched_by:
+            `${wanted} schedule ${option.schedule_id} (kept date ${deliveryDate} would give pack ` +
+            `${keptPackDate}, already gone — next available used instead)`,
+          delivery_date: option.delivery_date,
+          pack_date: option.pack_date || null,
+          production_date: option.production_date || null,
+          region: res.data.region?.name || null,
+          suburb: res.data.suburb?.name || candidate.suburb,
+          postcode: res.data.suburb?.postcode || candidate.postcode,
+          schedule_id: option.schedule_id ?? null,
+          delivery_day: option.delivery_day || wanted,
+          delivery_window: option.delivery_window || null,
+          formatted_date: option.formatted_date || formatLongDate(option.delivery_date),
+          option,
+          cutoff_override: cutoffFor(option),
+        }
+      : {
+          charge_date: String(order.created_at || '').slice(0, 10) || null,
+          matched_by: `${wanted} schedule ${option.schedule_id} (delivery date kept as it was)`,
+          delivery_date: deliveryDate,
+          pack_date: keptPackDate,
+          production_date: productionGap == null ? null : subtractDays(deliveryDate, productionGap),
+          region: res.data.region?.name || null,
+          suburb: res.data.suburb?.name || candidate.suburb,
+          postcode: res.data.suburb?.postcode || candidate.postcode,
+          schedule_id: option.schedule_id ?? null,
+          delivery_day: option.delivery_day || wanted,
+          delivery_window: option.delivery_window || null,
+          formatted_date: formatLongDate(deliveryDate),
+          option,
+          // The cutoff for THIS delivery date, from the schedule's own cutoff weekday.
+          // Not the order date: these orders are not charged at the HDS cutoff.
+          cutoff_override: cutoffFor({ delivery_date: deliveryDate, cutoff_info: option.cutoff_info }),
+        };
 
     const built = buildOrderAttributes(resolved, {
       preferredWindow: getNoteAttribute(order, 'HDS Delivery Window'),
@@ -836,6 +872,14 @@ async function fillHdsRecords(order, { dryRun = false, overwrite = false } = {})
       attributes = attributes['Pick-Pack-Date']
         ? { 'Pick-Pack-Date': attributes['Pick-Pack-Date'] }
         : {};
+    }
+
+    // The staleness fallback moved Delivery-Date itself, and that has to reach
+    // the order even in additive mode — otherwise Delivery-Date stays pointing
+    // at a cycle that's gone while Pick-Pack-Date quietly describes a different
+    // one, which reads as more broken than either value alone would.
+    if (packIsStale && built['Delivery-Date']) {
+      attributes = { ...attributes, 'Delivery-Date': built['Delivery-Date'] };
     }
 
     if (!Object.keys(attributes).length) {
