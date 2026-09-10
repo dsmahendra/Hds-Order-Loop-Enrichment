@@ -1,20 +1,27 @@
-// Manually set the pack date on orders placed in a time window, or on an
-// explicit named list.
+// Manually set the pack date on orders placed in a time window, an explicit
+// named list, or a range of order names.
 //
 //   node src/scripts/packdate-manual.js --from "2026-09-04 3:55 pm" --to "2026-09-04 4:07 pm" --dry-run
 //   node src/scripts/packdate-manual.js --from "2026-09-04 15:55" --to "2026-09-04 16:07" --date 2026/09/05
 //   node src/scripts/packdate-manual.js --name WM141937 --name WM141926 --date 2026/09/11 --overwrite
+//   node src/scripts/packdate-manual.js --from-name WM142033 --to-name WM142220 --date 2026/09/12
 //
 // Deliberately standalone. It reads the same helpers the service uses but changes
 // none of them, and nothing in the webhook, the queue or the retry job calls into
 // this file — so running it, or getting it wrong, cannot affect how orders are
 // handled as they arrive.
 //
-// Two ways to pick WHICH orders (pick exactly one):
+// Three ways to pick WHICH orders (pick exactly one):
 //
-//   --from/--to     every order created in that store-time window
-//   --name          only the named orders, repeatable — for a specific list off a
-//                   spreadsheet rather than everything from a burst
+//   --from/--to             every order created in that store-time window
+//   --name                  only the named orders, repeatable — for a specific
+//                           list off a spreadsheet rather than everything from
+//                           a burst
+//   --from-name/--to-name   every order whose NAME falls in that range,
+//                           inclusive — for "these ~190 consecutive orders",
+//                           where listing each one by --name would be
+//                           impractical. Order doesn't matter: given backwards
+//                           (the higher number first) it is normalised.
 //
 // Two ways to pick the DATE:
 //
@@ -31,15 +38,21 @@
 // wrong orders.
 //
 // Flags
-//   --from <when>   start of the window, inclusive. Mutually exclusive with --name.
-//   --to <when>     end of the window, inclusive.
-//   --name <name>   an order name, e.g. WM141937. Repeatable. Mutually exclusive
-//                   with --from/--to.
-//   --date <date>   the pack date to write. Omit to compute per order.
-//   --dry-run       report what would change, write nothing
-//   --overwrite     replace a pack date the order already has
-//   --tags          also add the Pick-Pack-Date-DD-MM-YYYY tag. Off by default, so
-//                   by default this touches one attribute and nothing else.
+//   --from <when>     start of the window, inclusive. Mutually exclusive with
+//                     --name and --from-name/--to-name.
+//   --to <when>       end of the window, inclusive.
+//   --name <name>     an order name, e.g. WM141937. Repeatable.
+//   --from-name <n>   low end of an order-name range, inclusive.
+//   --to-name <n>     high end of an order-name range, inclusive.
+//   --since <date>    bound the scan for --from-name/--to-name to orders
+//                     created on/after this ISO date — much faster when the
+//                     range is recent. Omit to scan the whole store.
+//   --date <date>     the pack date to write. Omit to compute per order.
+//   --dry-run         report what would change, write nothing
+//   --overwrite       replace a pack date the order already has
+//   --tags            also add the Pick-Pack-Date-DD-MM-YYYY tag. Off by
+//                     default, so by default this touches one attribute and
+//                     nothing else.
 
 require('dotenv').config();
 const {
@@ -61,6 +74,9 @@ function parseArgs(argv) {
     if (a === '--from') opts.from = argv[++i];
     else if (a === '--to') opts.to = argv[++i];
     else if (a === '--name') opts.names.push(argv[++i]);
+    else if (a === '--from-name') opts.fromName = argv[++i];
+    else if (a === '--to-name') opts.toName = argv[++i];
+    else if (a === '--since') opts.since = argv[++i];
     else if (a === '--date') opts.date = argv[++i];
     else if (a === '--dry-run') opts.dryRun = true;
     else if (a === '--overwrite') opts.overwrite = true;
@@ -68,6 +84,22 @@ function parseArgs(argv) {
     else throw new Error(`unknown flag ${a}`);
   }
   return opts;
+}
+
+// "WM141076" -> { prefix: 'WM', number: 141076 }, compared numerically so a
+// range does not misbehave the moment digit counts differ.
+function parseName(name) {
+  const m = String(name || '').trim().match(/^([^\d]*)(\d+)$/);
+  return m ? { prefix: m[1], number: Number(m[2]) } : null;
+}
+
+function inNameRange(orderName, from, to) {
+  const n = parseName(orderName);
+  if (!n) return false;
+  if (from && n.prefix.toLowerCase() !== from.prefix.toLowerCase()) return false;
+  if (from && n.number < from.number) return false;
+  if (to && n.number > to.number) return false;
+  return true;
 }
 
 // Accepts what a person would actually type from the order page:
@@ -123,17 +155,45 @@ async function main() {
   const opts = parseArgs(process.argv.slice(2));
 
   const byName = opts.names.length > 0;
-  const byWindow = opts.from || opts.to;
+  const byNameRange = Boolean(opts.fromName || opts.toName);
+  const byWindow = Boolean(opts.from || opts.to);
 
-  if (byName && byWindow) {
-    console.error('--name cannot be combined with --from/--to — pick one way to select orders.');
+  const modesUsed = [byName, byNameRange, byWindow].filter(Boolean).length;
+  if (modesUsed > 1) {
+    console.error(
+      '--name, --from-name/--to-name and --from/--to are three different ways to pick orders — use only one.'
+    );
     process.exitCode = 1;
     return;
   }
 
   let from = null;
   let to = null;
-  if (!byName) {
+  let nameFrom = null;
+  let nameTo = null;
+
+  if (byNameRange) {
+    if (!opts.fromName || !opts.toName) {
+      console.error('--from-name and --to-name must be given together.');
+      process.exitCode = 1;
+      return;
+    }
+    nameFrom = parseName(opts.fromName);
+    nameTo = parseName(opts.toName);
+    if (!nameFrom) {
+      console.error(`--from-name ${opts.fromName} is not an order name`);
+      process.exitCode = 1;
+      return;
+    }
+    if (!nameTo) {
+      console.error(`--to-name ${opts.toName} is not an order name`);
+      process.exitCode = 1;
+      return;
+    }
+    // Order doesn't matter to a person reading it off a spreadsheet — normalise
+    // rather than silently matching nothing when it's given high-to-low.
+    if (nameFrom.number > nameTo.number) [nameFrom, nameTo] = [nameTo, nameFrom];
+  } else if (!byName) {
     from = parseWhen(opts.from);
     to = parseWhen(opts.to, { end: true });
 
@@ -142,6 +202,7 @@ async function main() {
       console.error('  --from "2026-09-04 3:55 pm" --to "2026-09-04 4:07 pm" [--date 2026/09/05]');
       console.error('  --from "2026-09-04 15:55"   --to "2026-09-04 16:07"');
       console.error('  --name WM141937 --name WM141926 --date 2026/09/11');
+      console.error('  --from-name WM142033 --to-name WM142220 --date 2026/09/12');
       if (opts.from && !from) console.error(`\n--from ${opts.from} is not a date/time`);
       if (opts.to && !to) console.error(`\n--to ${opts.to} is not a date/time`);
       process.exitCode = 1;
@@ -166,7 +227,14 @@ async function main() {
   }
 
   console.log('store    :', process.env.SHOPIFY_STORE || 'MISSING');
-  console.log('selection:', byName ? `${opts.names.length} named order(s)` : `${from} .. ${to} (store time)`);
+  console.log(
+    'selection:',
+    byName
+      ? `${opts.names.length} named order(s)`
+      : byNameRange
+        ? `${nameFrom.prefix}${nameFrom.number} .. ${nameTo.prefix}${nameTo.number}`
+        : `${from} .. ${to} (store time)`
+  );
   console.log('pack date:', packSlash || 'computed per order from HDS');
   console.log('mode     :', opts.dryRun ? 'DRY RUN (nothing written)' : 'writing');
   console.log('existing :', opts.overwrite ? 'WILL BE REPLACED' : 'left alone');
@@ -193,6 +261,23 @@ async function main() {
       }
       matched.push(order);
     }
+  } else if (byNameRange) {
+    let pageInfo = null;
+    do {
+      const res = await listOrders({
+        limit: 250,
+        pageInfo,
+        createdAtMin: pageInfo ? null : opts.since || null,
+        fields: pageInfo ? null : 'id,name,created_at,tags,note_attributes,shipping_address',
+      });
+      pageInfo = res.pageInfo;
+      if (!res.orders.length) break;
+
+      scanned += res.orders.length;
+      for (const order of res.orders) {
+        if (inNameRange(order.name, nameFrom, nameTo)) matched.push(order);
+      }
+    } while (pageInfo);
   } else {
     // The window names its own day, so start the scan there.
     const since = from.slice(0, 10);
@@ -220,13 +305,17 @@ async function main() {
   console.log(
     byName
       ? `${matched.length} of ${scanned} named order(s) found\n`
-      : `scanned ${scanned} order(s) from ${from.slice(0, 10)}; ${matched.length} inside the window\n`
+      : byNameRange
+        ? `scanned ${scanned} order(s); ${matched.length} in the name range\n`
+        : `scanned ${scanned} order(s) from ${from.slice(0, 10)}; ${matched.length} inside the window\n`
   );
   if (!matched.length) {
     console.log(
       byName
         ? 'None of the given names were found — check the spelling against the order page.'
-        : 'Nothing matched. Check the times against the order page — they are store time, and the window is inclusive at both ends.'
+        : byNameRange
+          ? 'Nothing matched that name range. Pass --since if the range is recent, to make sure the scan reaches it, or check the prefix/numbers.'
+          : 'Nothing matched. Check the times against the order page — they are store time, and the window is inclusive at both ends.'
     );
     if (notFound) process.exitCode = 1;
     return;
