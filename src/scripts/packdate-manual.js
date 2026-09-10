@@ -277,6 +277,14 @@ async function main() {
       for (const order of res.orders) {
         if (inNameRange(order.name, nameFrom, nameTo)) matched.push(order);
       }
+
+      // Without --since this pages through the WHOLE store at ~2 req/s and
+      // prints nothing else until it's done — which looks identical to hung.
+      // One line per page (up to 250 orders) says it's actually progressing.
+      const last = res.orders[res.orders.length - 1];
+      console.log(
+        `  ...scanned ${scanned} so far, up to ${last.name} (${String(last.created_at).slice(0, 10)}) — ${matched.length} matched`
+      );
     } while (pageInfo);
   } else {
     // The window names its own day, so start the scan there.
@@ -296,6 +304,13 @@ async function main() {
       scanned += res.orders.length;
       for (const order of res.orders) {
         if (withinWindow(order, from, to)) matched.push(order);
+      }
+
+      if (pageInfo) {
+        const last = res.orders[res.orders.length - 1];
+        console.log(
+          `  ...scanned ${scanned} so far, up to ${last.name} (${String(last.created_at).slice(0, 16).replace('T', ' ')}) — ${matched.length} matched`
+        );
       }
     } while (pageInfo);
   }
