@@ -18,6 +18,7 @@
     "packdate:manual": "node src/scripts/packdate-manual.js",
     "packdates:backfill": "node src/scripts/packdates-backfill.js",
     "packdates:sweep": "node src/scripts/packdates-sweep.js",
+    "schedules:stuck": "node src/scripts/stuck-schedules.js",
     "labels:rename": "node src/scripts/labels-rename.js",
     "test": "node --test \"test/*.test.js\""
   },
