@@ -30,6 +30,24 @@ const { checkOrder } = require('../lib/stuck-order-check');
 
 const INTERVAL_MS = Number(process.env.ALERT_DIGEST_INTERVAL_MS || 24 * 60 * 60 * 1000);
 
+// Fixed clock time, UTC (Railway's default unless TZ is set), to send at
+// every day — e.g. ALERT_DIGEST_HOUR_UTC=22 for 8am AEST. Without this,
+// "once a day" only ever meant "every 24h counted from whenever the process
+// last started", so a redeploy silently shifted what time of day it actually
+// fires. Leave unset to keep that simpler boot-relative behavior instead.
+const DIGEST_HOUR_UTC =
+  process.env.ALERT_DIGEST_HOUR_UTC !== undefined ? Number(process.env.ALERT_DIGEST_HOUR_UTC) : null;
+const hasFixedHour = Number.isInteger(DIGEST_HOUR_UTC) && DIGEST_HOUR_UTC >= 0 && DIGEST_HOUR_UTC <= 23;
+
+// Milliseconds until the next occurrence of `hour:00 UTC` — today if it
+// hasn't happened yet, otherwise tomorrow. Pure and testable: takes "now"
+// explicitly rather than reading the clock itself.
+function msUntilNextHour(hour, now = new Date()) {
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), hour, 0, 0, 0));
+  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+  return next.getTime() - now.getTime();
+}
+
 // How far back to look for CANDIDATES. Wide by default, same reasoning as
 // stuck-schedules.js: a row that exhausted its retries stops updating from
 // that point on, so "recently touched" is the wrong filter for "currently
@@ -164,14 +182,29 @@ function initAlertDigest() {
     return;
   }
 
-  console.log(
-    `[alert-digest] started (every ${Math.round(INTERVAL_MS / 3600000)}h, looking back ${HOURS}h, ` +
-      `${isConfigured() ? 'SMTP configured' : 'SMTP NOT configured — will log only'})`
-  );
+  const smtpNote = isConfigured() ? 'SMTP configured' : 'SMTP NOT configured — will log only';
+  const runOnce = () => runDigest().catch((err) => console.error('[alert-digest] pass failed:', err.message || err));
 
-  setInterval(() => {
-    runDigest().catch((err) => console.error('[alert-digest] pass failed:', err.message || err));
-  }, INTERVAL_MS);
+  if (hasFixedHour) {
+    const delay = msUntilNextHour(DIGEST_HOUR_UTC);
+    console.log(
+      `[alert-digest] started (daily at ${String(DIGEST_HOUR_UTC).padStart(2, '0')}:00 UTC, ` +
+        `first run in ${Math.round(delay / 60000)}m, looking back ${HOURS}h, ${smtpNote})`
+    );
+    // Re-scheduled after each run rather than a single 24h setInterval, so a
+    // long-running process doesn't quietly drift off the target hour.
+    const tick = () => {
+      runOnce();
+      setTimeout(tick, msUntilNextHour(DIGEST_HOUR_UTC, new Date(Date.now() + 60000)));
+    };
+    setTimeout(tick, delay);
+  } else {
+    console.log(
+      `[alert-digest] started (every ${Math.round(INTERVAL_MS / 3600000)}h from boot — set ` +
+        `ALERT_DIGEST_HOUR_UTC for a fixed daily time instead, looking back ${HOURS}h, ${smtpNote})`
+    );
+    setInterval(runOnce, INTERVAL_MS);
+  }
 }
 
-module.exports = { initAlertDigest, runDigest, buildDigestEmail };
+module.exports = { initAlertDigest, runDigest, buildDigestEmail, msUntilNextHour };
