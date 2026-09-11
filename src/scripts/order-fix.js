@@ -52,6 +52,12 @@ function parseArgs(argv) {
 // Keep the enrichment pipeline honest: the stale attributes already produced an
 // order_enrichments row, so reset the queue entry to pending with the corrected
 // values and let the normal processor redo it.
+//
+// Does NOT end the pool — this runs once per --order in the same process, and
+// a pool ended after the first would break every requeue after it (seen in
+// practice: a 5-order run wrote all 5 Shopify orders correctly but reported
+// 4 "failed" purely because the pool from order 1's requeue was already
+// closed). main() ends it once, after every order is done.
 async function requeue(orderId, resolved, attributes) {
   const { pool } = require('../db');
   const hds = buildHdsAttributes(resolved, attributes['HDS Delivery Window']);
@@ -70,7 +76,6 @@ async function requeue(orderId, resolved, attributes) {
       hds,
     ]
   );
-  await pool.end();
   return rowCount;
 }
 
@@ -141,9 +146,16 @@ async function runOne(ref, opts) {
 
   console.log('  ✓ written to the Shopify order');
 
+  // Best-effort: the Shopify write above is what actually matters and has
+  // already landed, so a requeue problem is reported but must not make the
+  // whole order look like it failed.
   if (!opts.noRequeue && process.env.DATABASE_URL && out.resolved) {
-    const n = await requeue(orderId, out.resolved, out.wrote || {});
-    console.log(n ? '  ✓ enrichment queue row reset to pending' : '  (no queue row for this order)');
+    try {
+      const n = await requeue(orderId, out.resolved, out.wrote || {});
+      console.log(n ? '  ✓ enrichment queue row reset to pending' : '  (no queue row for this order)');
+    } catch (err) {
+      console.warn(`  ⚠ enrichment queue row not reset — ${err.message.split('\n')[0]}`);
+    }
   }
   return { written: true };
 }
@@ -185,7 +197,19 @@ async function main() {
   if (failures.length) process.exitCode = 1;
 }
 
-main().catch((err) => {
-  console.error('\nERROR:', err.message);
-  process.exitCode = 1;
-});
+main()
+  .catch((err) => {
+    console.error('\nERROR:', err.message);
+    process.exitCode = 1;
+  })
+  .finally(async () => {
+    // Closed exactly once, after every order in this run is done — never
+    // inside requeue() itself, which runs once per --order.
+    if (process.env.DATABASE_URL) {
+      try {
+        await require('../db').pool.end();
+      } catch {
+        // Nothing to close, or already closed.
+      }
+    }
+  });
