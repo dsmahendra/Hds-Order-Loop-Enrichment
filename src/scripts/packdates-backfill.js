@@ -28,7 +28,7 @@
 require('dotenv').config();
 const { listOrders, getNoteAttribute } = require('../shopify');
 const { applyHdsToOrder, planFor } = require('../lib/apply-hds');
-const { HELD_TAG } = require('../lib/renewal-rewrite');
+const { HELD_TAG, locationFor } = require('../lib/renewal-rewrite');
 
 // Shopify allows 2 REST calls/second sustained. Each order costs a read (already
 // paid by the page fetch) plus up to two writes, so pace the writes.
@@ -156,8 +156,14 @@ async function main() {
         }
         if (!out.ok) {
           failed += 1;
-          failures.push(`${label}: ${out.reason}`);
-          console.log(`  FAILED  ${label}: ${out.reason}`);
+          // Address always shown explicitly here, not just when the reason
+          // text happens to mention it — this is usually a suburb HDS doesn't
+          // recognise or doesn't currently schedule the customer's weekday
+          // for, and the address is the first thing worth checking.
+          const loc = locationFor(order);
+          const line = `${label}: ${out.reason}  [${loc.suburb || '?'} / ${loc.postcode || '?'}]`;
+          failures.push(line);
+          console.log(`  FAILED  ${line}`);
           continue;
         }
 
