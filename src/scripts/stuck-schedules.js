@@ -14,15 +14,11 @@
 // Nothing here writes to Shopify, Loop, our own tables, or the HDS API.
 //
 // orders_to_enrich is used ONLY to find which order ids are worth checking —
-// NOT for their recorded postcode/suburb. delivery_location_id there is
-// whatever the webhook grabbed first, which for these orders is very often
-// the raw "Delivery-Location-Id" note attribute — a Zapiet/Shop-Pay internal
-// location id ("290879"), not a real postcode (fillHdsRecords itself never
-// trusts that field unless it's actually postcode-shaped; see
-// locationCandidatesFor in renewal-rewrite.js). Feeding that straight to HDS
-// answers "not available for delivery" for an unrelated reason and drowns out
-// the real answer, so this fetches each order fresh from Shopify and resolves
-// its location exactly the way fillHdsRecords does.
+// the actual verdict comes from checkOrder() (src/lib/stuck-order-check.js),
+// shared with the alert digest, which fetches each order fresh and resolves
+// its location the way fillHdsRecords itself does (not the DB's own recorded
+// postcode/suburb, which is often the Zapiet/Shop-Pay internal location id
+// rather than a real postcode).
 //
 // Flags
 //   --hours <n>   how far back to look at orders_to_enrich.updated_at to find
@@ -36,14 +32,7 @@
 
 require('dotenv').config();
 const { pool } = require('../db');
-const { fetchDeliveryOptions } = require('../lib/renewal-date');
-const { weekdayOf, locationCandidatesFor, locationFor } = require('../lib/renewal-rewrite');
-const { getOrder, getNoteAttribute, normalizeDate } = require('../shopify');
-
-const packDateOf = (order) =>
-  getNoteAttribute(order, 'Pick-Pack-Date') ||
-  getNoteAttribute(order, 'HDS Ship Date') ||
-  getNoteAttribute(order, 'HDS Pack Date');
+const { checkOrder } = require('../lib/stuck-order-check');
 
 function parseArgs(argv) {
   const opts = { hours: 24 * 30 };
@@ -77,7 +66,7 @@ async function main() {
   // fetching fresh. Everything else about the order comes from Shopify below.
   const { rows } = await pool.query(
     `SELECT DISTINCT ON (COALESCE(subscription_id::text, order_id::text))
-        order_id, subscription_id, status, attempts, error_message, updated_at
+        order_id, subscription_id
        FROM orders_to_enrich
       WHERE (status = 'failed' OR hds_write_ok = FALSE)
         AND updated_at >= NOW() - ($1::int * INTERVAL '1 hour')
@@ -97,87 +86,33 @@ async function main() {
       ? `subscription ${row.subscription_id} (order ${row.order_id})`
       : `order ${row.order_id} (no subscription resolved)`;
 
-    let order;
-    try {
-      order = (await getOrder(row.order_id))?.order;
-    } catch (err) {
-      otherCause += 1;
-      console.log(`  ?       ${label}: could not fetch the order from Shopify — ${err.message.split('\n')[0]}`);
-      continue;
-    }
-    if (!order) {
-      skipped += 1;
-      console.log(`  SKIP    ${label}: order not found in Shopify (deleted?)`);
-      continue;
-    }
+    const result = await checkOrder(row.order_id);
 
-    if (packDateOf(order)) {
-      // Fixed since this row was recorded — by a manual order:fix, a later
-      // successful sweep pass, or someone correcting it by hand.
-      alreadyFixed += 1;
-      continue;
+    switch (result.verdict) {
+      case 'fetch-failed':
+        otherCause += 1;
+        console.log(`  ?       ${label}: could not fetch the order from Shopify — ${result.detail}`);
+        break;
+      case 'not-found':
+        skipped += 1;
+        console.log(`  SKIP    ${label}: order not found in Shopify (deleted?)`);
+        break;
+      case 'fixed':
+        alreadyFixed += 1;
+        break;
+      case 'skip':
+        skipped += 1;
+        console.log(`  SKIP    ${label}: ${result.detail}`);
+        break;
+      case 'other':
+        otherCause += 1;
+        console.log(`  OTHER   ${label}: ${result.detail}`);
+        break;
+      case 'stuck':
+        stuck += 1;
+        console.log(`  STUCK   ${label}: ${result.detail}`);
+        break;
     }
-
-    const candidates = locationCandidatesFor(order);
-    if (!candidates.length) {
-      const partial = locationFor(order);
-      skipped += 1;
-      console.log(
-        `  SKIP    ${label}: no usable postcode/suburb on the order ` +
-          `(shipping address / HDS attributes) — best guess ${partial.suburb || '?'} / ${partial.postcode || '?'}`
-      );
-      continue;
-    }
-
-    const rawDelivery = getNoteAttribute(order, 'Delivery-Date') || getNoteAttribute(order, 'HDS Delivery Date');
-    const deliveryDate = rawDelivery ? normalizeDate(rawDelivery) : null;
-    const wanted = deliveryDate ? weekdayOf(deliveryDate) : null;
-    if (!wanted) {
-      skipped += 1;
-      console.log(`  SKIP    ${label}: no parseable Delivery-Date on the order`);
-      continue;
-    }
-
-    // Same fallback order fillHdsRecords itself tries: shipping address, then
-    // the labelled HDS attributes — so this reaches the identical verdict.
-    let offered = null;
-    let checkedWith = null;
-    let hdsFailure = null;
-    for (const candidate of candidates) {
-      const res = await fetchDeliveryOptions({ postcode: candidate.postcode, suburb: candidate.suburb });
-      if (!res.ok) {
-        hdsFailure = `${candidate.suburb} ${candidate.postcode} (${candidate.source}): ${res.reason}`;
-        continue;
-      }
-      offered = [...new Set((res.data.delivery_options || []).map((o) => o.delivery_day))];
-      checkedWith = candidate;
-      if (offered.some((d) => String(d).toLowerCase() === wanted.toLowerCase())) break;
-    }
-
-    if (!offered) {
-      otherCause += 1;
-      console.log(`  ?       ${label}: could not check HDS for any candidate address — ${hdsFailure}`);
-      continue;
-    }
-
-    const isOffered = offered.some((d) => String(d).toLowerCase() === wanted.toLowerCase());
-    if (isOffered) {
-      // HDS offers this weekday now, so whatever failed was something else —
-      // a transient blip at the time, an address HDS didn't recognise, etc.
-      // Worth listing, but not the "permanently stuck" class this exists to find.
-      otherCause += 1;
-      console.log(
-        `  OTHER   ${label}: ${checkedWith.suburb} ${checkedWith.postcode} DOES offer ${wanted} now — ` +
-          `different cause (${row.error_message || row.status})`
-      );
-      continue;
-    }
-
-    stuck += 1;
-    console.log(
-      `  STUCK   ${label}: anchored to ${wanted} for ${checkedWith.suburb} ${checkedWith.postcode}, ` +
-        `but HDS now only offers ${offered.join(', ') || 'nothing'} there`
-    );
   }
 
   console.log(
