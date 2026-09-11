@@ -32,6 +32,22 @@ const { pool } = require('../db');
 const { fetchDeliveryOptions } = require('../lib/renewal-date');
 const { weekdayOf } = require('../lib/renewal-rewrite');
 
+// pg returns DATE/TIMESTAMPTZ columns as JS Date objects, not strings — so
+// String(value).slice(0, 10) silently produces "Mon Sep 15 2026 ..." instead
+// of "2026-09-15", and weekdayOf() (which expects the latter) fails on it.
+// Same helper as enrich-orders-queue.js's toISODate(), which exists for
+// exactly this reason.
+function toISODate(value) {
+  if (!value) return null;
+  if (value instanceof Date) {
+    const y = value.getUTCFullYear();
+    const m = String(value.getUTCMonth() + 1).padStart(2, '0');
+    const d = String(value.getUTCDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+  }
+  return String(value).slice(0, 10);
+}
+
 function parseArgs(argv) {
   const opts = { hours: 24 * 30 };
   for (let i = 0; i < argv.length; i += 1) {
@@ -86,7 +102,7 @@ async function main() {
 
     const postcode = row.delivery_location_id;
     const suburb = row.suburb;
-    const deliveryDate = row.delivery_date ? String(row.delivery_date).slice(0, 10) : null;
+    const deliveryDate = toISODate(row.delivery_date);
     const wanted = deliveryDate ? weekdayOf(deliveryDate) : null;
 
     if (!postcode || !suburb || !wanted) {
@@ -124,7 +140,7 @@ async function main() {
     console.log(
       `  STUCK   ${label}: anchored to ${wanted} for ${suburb} ${postcode}, but HDS now only offers ` +
         `${offered.join(', ') || 'nothing'} there (${row.attempts} attempt(s) already failed, ` +
-        `last ${String(row.updated_at).slice(0, 10)})`
+        `last ${toISODate(row.updated_at)})`
     );
   }
 
