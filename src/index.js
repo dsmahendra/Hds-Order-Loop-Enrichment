@@ -6,6 +6,7 @@ const shopifyOauth = require('./shopify-oauth');
 const { initQueueProcessor } = require('./jobs/enrich-orders-queue');
 const { initHdsRetry } = require('./jobs/retry-hds-writes');
 const { initPackDateSweep } = require('./jobs/sweep-missing-packdates');
+const { initAlertDigest } = require('./jobs/alert-digest');
 const { applySchema } = require('./db-bootstrap');
 
 const app = express();
@@ -40,4 +41,8 @@ app.listen(PORT, async () => {
   // Last line of defence, and the only one that does not depend on the webhook
   // having arrived or on our queue holding a row for the order.
   initPackDateSweep();
+
+  // Email admin a periodic summary of anything still outstanding. Optional:
+  // does nothing but log without SMTP configured.
+  initAlertDigest();
 });
