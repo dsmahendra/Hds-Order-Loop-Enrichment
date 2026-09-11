@@ -6,7 +6,7 @@ const assert = require('node:assert/strict');
 
 process.env.SHOPIFY_STORE = 'workoutmeals.myshopify.com';
 
-const { buildDigestEmail } = require('../src/jobs/alert-digest');
+const { buildDigestEmail, msUntilNextHour } = require('../src/jobs/alert-digest');
 
 test('no stuck orders means no email at all', () => {
   assert.equal(buildDigestEmail([]), null);
@@ -67,4 +67,28 @@ test('orders beyond the cap are summarised, not all listed', () => {
   // overflow note must.
   assert.ok(!email.text.includes('WM1029'), 'must not list every row past the cap');
   assert.match(email.text, /5 more not shown/);
+});
+
+// msUntilNextHour drives the fixed daily send time (ALERT_DIGEST_HOUR_UTC) —
+// pure and given "now" explicitly so it's deterministic regardless of when
+// the suite actually runs.
+
+test('msUntilNextHour counts forward to later today when the hour has not passed', () => {
+  const now = new Date('2026-09-11T05:00:00Z');
+  const ms = msUntilNextHour(22, now); // 22:00 UTC, still ahead of 05:00
+  assert.equal(ms, 17 * 60 * 60 * 1000);
+});
+
+test('msUntilNextHour rolls to tomorrow when the hour has already passed today', () => {
+  const now = new Date('2026-09-11T23:00:00Z');
+  const ms = msUntilNextHour(22, now); // 22:00 UTC already gone today
+  assert.equal(ms, 23 * 60 * 60 * 1000);
+});
+
+test('msUntilNextHour rolls to tomorrow at the exact instant of the target hour', () => {
+  // Never fires twice for "the same" instant — exactly on the hour counts as
+  // already happened, not still pending.
+  const now = new Date('2026-09-11T22:00:00Z');
+  const ms = msUntilNextHour(22, now);
+  assert.equal(ms, 24 * 60 * 60 * 1000);
 });
