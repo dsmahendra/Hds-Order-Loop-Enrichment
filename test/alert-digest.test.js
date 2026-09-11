@@ -6,7 +6,7 @@ const assert = require('node:assert/strict');
 
 process.env.SHOPIFY_STORE = 'workoutmeals.myshopify.com';
 
-const { buildDigestEmail, msUntilNextHour } = require('../src/jobs/alert-digest');
+const { buildDigestEmail, msUntilNextHour, msUntilNextOccurrence, parseHHMM } = require('../src/jobs/alert-digest');
 
 test('no stuck orders means no email at all', () => {
   assert.equal(buildDigestEmail([]), null);
@@ -91,4 +91,44 @@ test('msUntilNextHour rolls to tomorrow at the exact instant of the target hour'
   const now = new Date('2026-09-11T22:00:00Z');
   const ms = msUntilNextHour(22, now);
   assert.equal(ms, 24 * 60 * 60 * 1000);
+});
+
+test('msUntilNextHour honours a minute offset, not just the hour', () => {
+  const now = new Date('2026-09-11T03:00:00Z');
+  const ms = msUntilNextHour(3, now, 5); // 03:05 UTC, 5 minutes ahead
+  assert.equal(ms, 5 * 60 * 1000);
+});
+
+// parseHHMM feeds ALERT_DIGEST_TIMES_UTC — reject anything that isn't a real
+// clock time rather than silently scheduling garbage.
+
+test('parseHHMM accepts a valid HH:MM', () => {
+  assert.deepEqual(parseHHMM('03:05'), { hour: 3, minute: 5 });
+  assert.deepEqual(parseHHMM(' 17:05 '), { hour: 17, minute: 5 });
+});
+
+test('parseHHMM rejects an out-of-range or malformed value', () => {
+  assert.equal(parseHHMM('24:00'), null);
+  assert.equal(parseHHMM('12:60'), null);
+  assert.equal(parseHHMM('not-a-time'), null);
+  assert.equal(parseHHMM(''), null);
+});
+
+// msUntilNextOccurrence drives multiple daily sends (1:05pm AND 5:05pm AEST =
+// 03:05 and 07:05 UTC) — one recurring timer cycles through all of them.
+
+test('msUntilNextOccurrence picks whichever of several times is soonest', () => {
+  const times = [parseHHMM('03:05'), parseHHMM('07:05')];
+  // 04:00 UTC: 03:05 has passed today, 07:05 is still ahead — soonest is 07:05.
+  const now = new Date('2026-09-11T04:00:00Z');
+  const ms = msUntilNextOccurrence(times, now);
+  assert.equal(ms, 3 * 60 * 60 * 1000 + 5 * 60 * 1000); // 3h05m to 07:05
+});
+
+test('msUntilNextOccurrence rolls to tomorrow\'s earliest time once all of today\'s have passed', () => {
+  const times = [parseHHMM('03:05'), parseHHMM('07:05')];
+  const now = new Date('2026-09-11T08:00:00Z'); // both today's times are gone
+  const ms = msUntilNextOccurrence(times, now);
+  // Next occurrence is tomorrow 03:05 — 19h05m from 08:00 today.
+  assert.equal(ms, 19 * 60 * 60 * 1000 + 5 * 60 * 1000);
 });

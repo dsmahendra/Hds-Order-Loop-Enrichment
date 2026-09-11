@@ -134,3 +134,16 @@ CREATE TABLE IF NOT EXISTS shopify_oauth_tokens (
 ALTER TABLE orders_to_enrich ADD COLUMN IF NOT EXISTS previous_delivery_date DATE;
 ALTER TABLE orders_to_enrich ADD COLUMN IF NOT EXISTS rewrite_matched_by VARCHAR(120);
 ALTER TABLE orders_to_enrich ADD COLUMN IF NOT EXISTS rewrite_schedule_source VARCHAR(120);
+
+-- Which orders the alert digest has already told admin about, and when.
+--
+-- Running twice a day (ALERT_DIGEST_TIMES_UTC) means the SAME still-stuck
+-- order would otherwise appear in both of a day's emails, and every day
+-- after that for as long as it stays broken. This lets the digest suppress
+-- an order it already reported within ALERT_DIGEST_DEDUPE_HOURS, so a
+-- genuinely persistent problem is still an occasional reminder rather than
+-- the same line repeated in every single send.
+CREATE TABLE IF NOT EXISTS alert_digest_notifications (
+  order_id         BIGINT PRIMARY KEY,
+  last_notified_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
