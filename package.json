@@ -19,6 +19,7 @@
     "packdates:backfill": "node src/scripts/packdates-backfill.js",
     "packdates:sweep": "node src/scripts/packdates-sweep.js",
     "schedules:stuck": "node src/scripts/stuck-schedules.js",
+    "alerts:digest": "node src/scripts/alert-digest-now.js",
     "labels:rename": "node src/scripts/labels-rename.js",
     "test": "node --test \"test/*.test.js\""
   },
@@ -28,6 +29,7 @@
   "dependencies": {
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "nodemailer": "^10.0.3",
     "pg": "^8.12.0"
   }
 }
