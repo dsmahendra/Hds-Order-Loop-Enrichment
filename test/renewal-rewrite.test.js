@@ -789,6 +789,79 @@ test('an order missing entirely by the time it is processed also gets the next a
   }
 });
 
+test('a stale kept date replaces the WHOLE HDS set, not just Delivery-Date, even additively', async () => {
+  // WM142311 in production: additive mode forced Delivery-Date through when it
+  // was stale, but left every OTHER field (HDS Ship Date, HDS Schedule ID, HDS
+  // Cutoff Date, HDS Region/Suburb/Postcode...) exactly as it was — because
+  // additiveOnly() saw those keys already had a (stale) value and protected
+  // them. The order ended up with a fresh Delivery-Date describing one cycle
+  // and a full set of "HDS *" fields still describing an old one — internally
+  // contradictory, and arguably worse than leaving it alone. Nothing here has
+  // --overwrite: this must self-correct in the ordinary additive path.
+  const staleDelivery = daysFromNow(-5);
+  const wanted = weekdayOfDate(staleDelivery);
+  const freshDelivery = daysFromNow(10);
+  const freshPack = daysFromNow(9);
+  const freshProduction = daysFromNow(8);
+
+  const schedule = [
+    {
+      schedule_id: 141,
+      delivery_day: wanted,
+      delivery_window: 'AM',
+      cutoff_info: 'Friday 11 PM',
+      delivery_date: freshDelivery,
+      pack_date: freshPack,
+      production_date: freshProduction,
+    },
+  ];
+
+  // Everything Loop copies verbatim from the subscription's frozen first cycle
+  // — internally consistent with ITSELF, but weeks stale as a group, exactly
+  // like the subscription attributes order:explain showed on WM142311.
+  const order = {
+    id: 7,
+    created_at: `${daysFromNow(-12)}T13:00:00+10:00`,
+    shipping_address: { city: 'Carrum', zip: '3197' },
+    ...attrs({
+      'Delivery-Date': slash(staleDelivery),
+      'HDS Delivery Date': slash(daysFromNow(-20)),
+      'HDS Delivery Formatted': 'stale',
+      'HDS Delivery Day': wanted,
+      'HDS Delivery Window': 'AM',
+      'HDS Schedule ID': '999',
+      'HDS Cutoff Day': 'Old',
+      'HDS Cutoff Date': slash(daysFromNow(-23)),
+      'Charge Offset': '99 Days',
+      'HDS Ship Date': slash(daysFromNow(-21)),
+      'HDS Production Date': slash(daysFromNow(-22)),
+      'HDS Region': 'Old Region',
+      'HDS Suburb': 'OLD SUBURB',
+      'HDS Postcode': '0000',
+    }),
+  };
+
+  const originalFetch = global.fetch;
+  clearDeliveryOptionsCache();
+  global.fetch = stubHds(schedule);
+  try {
+    // No overwrite — the ordinary path every webhook/backfill run actually uses.
+    const out = await fillHdsRecords(order, { dryRun: true });
+
+    assert.equal(out.ok, true, out.reason);
+    assert.equal(out.attributes['Delivery-Date'], slash(freshDelivery));
+    assert.equal(out.attributes['Pick-Pack-Date'], slash(freshPack));
+    assert.equal(out.attributes['HDS Ship Date'], slash(freshPack));
+    assert.equal(out.attributes['HDS Production Date'], slash(freshProduction));
+    assert.equal(out.attributes['HDS Schedule ID'], 141);
+    assert.equal(out.attributes['HDS Region'], 'VIC Melbourne Metro');
+    assert.equal(out.attributes['HDS Suburb'], 'CARRUM');
+    assert.notEqual(out.attributes['HDS Cutoff Date'], slash(daysFromNow(-23)), 'the old cutoff must not survive');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 // --- the range follows the chosen window ------------------------------------
 // Delivery-Time holds the clock range and nothing else: "8:00 AM - 6:00 PM", the
 // form it has always had and the form whatever reads it downstream expects. What

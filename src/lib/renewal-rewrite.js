@@ -864,22 +864,27 @@ async function fillHdsRecords(order, { dryRun = false, overwrite = false } = {})
     });
 
     const scope = fillScope();
-    let attributes = overwrite ? built : additiveOnly(order, built);
+
+    // The staleness fallback computed a fresh, self-consistent set of dates
+    // around the NEW delivery date HDS actually offers now — every field in
+    // `built` describes that same new cycle. additiveOnly() would otherwise
+    // protect the OLD cycle's now-superseded values (HDS Ship Date, HDS
+    // Schedule ID, HDS Cutoff Date, ...) because they're not technically
+    // "missing", leaving Delivery-Date pointing at the new cycle while
+    // everything else on the order still describes the one that just went by
+    // — an order like that is harder to trust than either value alone would
+    // be. So a stale kept date replaces the WHOLE built set, not just one key.
+    let attributes = packIsStale ? built : overwrite ? built : additiveOnly(order, built);
 
     if (scope === 'pack-date') {
-      // Just the one key NetSuite reads. Everything else the order already had
-      // stays exactly as it was.
-      attributes = attributes['Pick-Pack-Date']
-        ? { 'Pick-Pack-Date': attributes['Pick-Pack-Date'] }
-        : {};
-    }
-
-    // The staleness fallback moved Delivery-Date itself, and that has to reach
-    // the order even in additive mode — otherwise Delivery-Date stays pointing
-    // at a cycle that's gone while Pick-Pack-Date quietly describes a different
-    // one, which reads as more broken than either value alone would.
-    if (packIsStale && built['Delivery-Date']) {
-      attributes = { ...attributes, 'Delivery-Date': built['Delivery-Date'] };
+      // Just the one key NetSuite reads — but a stale kept date still needs
+      // Delivery-Date corrected alongside it, or the two describe different
+      // cycles even under the minimal scope.
+      const keep = attributes['Pick-Pack-Date'] ? { 'Pick-Pack-Date': attributes['Pick-Pack-Date'] } : {};
+      if (packIsStale && Object.keys(keep).length && attributes['Delivery-Date']) {
+        keep['Delivery-Date'] = attributes['Delivery-Date'];
+      }
+      attributes = keep;
     }
 
     if (!Object.keys(attributes).length) {
