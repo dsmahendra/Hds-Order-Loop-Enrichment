@@ -147,3 +147,12 @@ CREATE TABLE IF NOT EXISTS alert_digest_notifications (
   order_id         BIGINT PRIMARY KEY,
   last_notified_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- When the "every Loop order since last time" status report last ran, so the
+-- next run knows where its window starts. A single ever-growing table rather
+-- than one row updated in place, so the history of when digests actually ran
+-- is itself inspectable if a gap is ever in question.
+CREATE TABLE IF NOT EXISTS alert_digest_runs (
+  id     SERIAL PRIMARY KEY,
+  ran_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

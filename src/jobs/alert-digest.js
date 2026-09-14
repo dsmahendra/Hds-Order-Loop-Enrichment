@@ -1,39 +1,27 @@
-// Email admin a periodic digest of orders genuinely still missing pack date /
-// HDS data — the same [ALERT] condition the webhook, retry job and sweep
-// already log, surfaced somewhere that doesn't require watching Railway logs.
+// Email admin a periodic status report — ALWAYS sent, whether every order is
+// fine or not, so a quiet inbox never has to be trusted as "no news is good
+// news". Two sections:
 //
-// A digest, not one email per order: a burst (a Loop renewal run, a schedule
-// withdrawn for a suburb) can affect several orders in one pass, and one email
-// per order would be the inbox equivalent of the log spam [ALERT] tagging was
-// meant to fix. One email listing everything currently outstanding, on an
-// interval independent of how often the sweep or retry job themselves run.
-//
-// Every candidate order id (found cheaply from orders_to_enrich) is verified
-// live via checkOrder() (src/lib/stuck-order-check.js), shared with
-// stuck-schedules.js — NOT just read off the historical DB row. That row's
-// recorded postcode/suburb is often wrong (see locationCandidatesFor) and its
-// failure may already be fixed by the time the digest runs; reporting it
-// verbatim produced a 268-row email that was mostly stale noise. This costs a
-// Shopify + HDS call per candidate (same cost stuck-schedules.js already
-// pays), which is why this defaults to running once a day rather than on the
-// sweep's own tighter interval.
-//
-// A genuinely persistent problem (nobody's fixed the subscription yet) would
-// otherwise repeat in EVERY send — every day, and every one of several times
-// a day if ALERT_DIGEST_TIMES_UTC configures more than one. alert_digest_
-// notifications (see db/schema.sql) suppresses an order that already
-// appeared in an email within ALERT_DIGEST_DEDUPE_HOURS, so it resurfaces as
-// roughly one reminder per day rather than the same line every time.
+//   1. Every Loop subscription order since the last report, each with its own
+//      status line (order:label) — done, missing its pack date, missing OTHER
+//      HDS fields, or present-but-wrong. Sent even when every single one is
+//      fine, so admin can see the checker is actually running.
+//   2. Anything from a wider historical scan that's genuinely stuck on a
+//      weekday HDS has withdrawn for its suburb — these don't self-heal, so
+//      they're deduped (alert_digest_notifications) rather than repeated in
+//      every send.
 //
 //   node src/scripts/alert-digest-now.js     run one pass immediately
 //
 // Needs DATABASE_URL, SHOPIFY_STORE + SHOPIFY_ADMIN_TOKEN, and HDS_API_BASE to
 // verify candidates. Needs SMTP_HOST/PORT/USER/PASS, ALERT_EMAIL_FROM and
-// ALERT_EMAIL_TO to actually send — without them this logs what it would have
-// sent and does nothing else, so turning the job on early is harmless.
+// ALERT_EMAIL_TO to actually send — without them this logs the full report
+// and does nothing else, so turning the job on early is harmless.
 
 const { sendMail, isConfigured } = require('../lib/mailer');
 const { checkOrder } = require('../lib/stuck-order-check');
+const { classifyOrder } = require('../lib/order-status');
+const { getOrder } = require('../shopify');
 
 const INTERVAL_MS = Number(process.env.ALERT_DIGEST_INTERVAL_MS || 24 * 60 * 60 * 1000);
 
@@ -83,7 +71,13 @@ function msUntilNextOccurrence(times, now = new Date()) {
   return Math.min(...times.map((t) => msUntilNextHour(t.hour, now, t.minute)));
 }
 
-// How far back to look for CANDIDATES. Wide by default, same reasoning as
+// How far back the very FIRST report (ever, or after alert_digest_runs is
+// cleared) looks for Loop orders, since there's no previous run to measure
+// "since last time" from.
+const FIRST_RUN_HOURS = Number(process.env.ALERT_DIGEST_FIRST_RUN_HOURS || 24);
+
+// How far back to look for STUCK-schedule CANDIDATES (section 2 — a much
+// wider window than section 1's "since last report", same reasoning as
 // stuck-schedules.js: a row that exhausted its retries stops updating from
 // that point on, so "recently touched" is the wrong filter for "currently
 // still broken" — an order that went quiet weeks ago and was never fixed
@@ -97,13 +91,12 @@ const HOURS = Number(process.env.ALERT_DIGEST_HOURS || 24 * 30);
 // single email long enough to be unreadable.
 const MAX_ROWS = Number(process.env.ALERT_DIGEST_MAX_ROWS || 25);
 
-// How long a "still stuck" order is suppressed after appearing in an email,
-// before it's allowed to appear again. Sending several times a day
-// (ALERT_DIGEST_TIMES_UTC) would otherwise repeat the identical still-broken
-// order in every send; this keeps a persistent problem to roughly one
-// reminder per day instead. Deliberately a little under 24h so a 1:05pm/5:05pm
-// pair doesn't accidentally both land on the wrong side of an exact-24h
-// boundary and either double up or skip a day.
+// How long a "still stuck" order (section 2 only — section 1 never repeats an
+// order because its window never overlaps the previous report) is suppressed
+// after appearing in an email, before it's allowed to appear again. A
+// persistent problem would otherwise repeat in EVERY send. Deliberately a
+// little under 24h so a 1:05pm/5:05pm pair doesn't accidentally both land on
+// the wrong side of an exact-24h boundary and either double up or skip a day.
 const DEDUPE_HOURS = Number(process.env.ALERT_DIGEST_DEDUPE_HOURS || 20);
 
 // The Shopify admin URL for an order, built from SHOPIFY_STORE
@@ -117,16 +110,21 @@ function orderUrl(orderId) {
 }
 
 // Pure and side-effect-free on purpose, so it's testable without a database,
-// Shopify, or SMTP.
-// stuckOrders: [{ orderId, orderName, subscriptionId, detail }]
-// Returns null when there's nothing worth emailing.
-function buildDigestEmail(stuckOrders, { store = process.env.SHOPIFY_STORE || '(store not set)' } = {}) {
-  if (!stuckOrders.length) return null;
+// Shopify, or SMTP. NEVER returns null — always sent, "all clear" included.
+//
+// orderStatuses: [{ orderId, orderName, status, label }] — status 'done'
+//                counts as OK, anything else needs a look.
+// stuckOrders:   [{ orderId, orderName, subscriptionId, detail }]
+function buildReportEmail(orderStatuses, stuckOrders, { store = process.env.SHOPIFY_STORE || '(store not set)' } = {}) {
+  const problems = orderStatuses.filter((o) => o.status !== 'done');
 
-  const shown = stuckOrders.slice(0, MAX_ROWS);
-  const overflow = stuckOrders.length - shown.length;
+  const shownOrders = orderStatuses.slice(0, MAX_ROWS);
+  const overflowOrders = orderStatuses.length - shownOrders.length;
+  const orderLines = shownOrders.map((o) => `  Order ${o.orderName || o.orderId} = ${o.label}`);
 
-  const lines = shown.map((o) => {
+  const shownStuck = stuckOrders.slice(0, MAX_ROWS);
+  const overflowStuck = stuckOrders.length - shownStuck.length;
+  const stuckLines = shownStuck.map((o) => {
     const label = o.subscriptionId
       ? `subscription ${o.subscriptionId}, order ${o.orderName || o.orderId}`
       : `order ${o.orderName || o.orderId}`;
@@ -134,19 +132,38 @@ function buildDigestEmail(stuckOrders, { store = process.env.SHOPIFY_STORE || '(
     return `  - ${label}\n    ${o.detail}` + (url ? `\n    ${url}` : '');
   });
 
-  const subject = `[HDS] ${stuckOrders.length} order(s) still missing pack date / HDS data`;
+  const subject = !orderStatuses.length
+    ? `[HDS] Order status report — no new Loop orders since last check`
+    : !problems.length
+      ? `[HDS] Order status report — all ${orderStatuses.length} order(s) OK`
+      : `[HDS] Order status report — ${problems.length} of ${orderStatuses.length} order(s) need attention`;
 
-  const text =
-    `${store} — ${stuckOrders.length} order(s) checked live just now and confirmed still missing their ` +
-    `HDS data (pack date, delivery schedule, etc.). These do not self-heal on their own; each needs a ` +
-    `human decision.\n\n` +
-    lines.join('\n\n') +
-    (overflow > 0 ? `\n\n  ...and ${overflow} more not shown.` : '') +
-    '\n\n' +
-    'For the full picture with every category (stuck / already fixed / other cause):\n' +
+  let text = `${store} — Loop subscription order status report.\n\n`;
+
+  if (!orderStatuses.length) {
+    text += 'No new Loop subscription orders since the last report.\n';
+  } else {
+    text += `${orderStatuses.length} Loop subscription order(s) since the last report`;
+    text += problems.length ? `, ${problems.length} need attention:\n\n` : ', all fine:\n\n';
+    text += orderLines.join('\n');
+    if (overflowOrders > 0) text += `\n  ...and ${overflowOrders} more not shown.`;
+    text += '\n';
+  }
+
+  if (stuckOrders.length) {
+    text +=
+      `\n${stuckOrders.length} order(s) from earlier are stuck on a weekday HDS no longer offers for their ` +
+      `suburb (these do NOT self-heal — each needs a human decision on which day to move it to):\n\n` +
+      stuckLines.join('\n\n') +
+      (overflowStuck > 0 ? `\n\n  ...and ${overflowStuck} more not shown.` : '') +
+      '\n';
+  }
+
+  text +=
+    '\nFor the full picture (including whether each is a real schedule problem or something else):\n' +
     '  node src/scripts/stuck-schedules.js\n\n' +
-    'To fix one order once you know which day to move it to:\n' +
-    '  RENEWAL_DELIVERY_SELECTION=earliest node src/scripts/order-fix.js --order <id> --force\n';
+    'To fix one order once you know what it needs:\n' +
+    '  node src/scripts/order-fix.js --order <id> [--force | --recompute]\n';
 
   return { subject, text };
 }
@@ -158,7 +175,58 @@ async function runDigest() {
   }
 
   const { pool } = require('../db');
-  const { rows } = await pool.query(
+
+  // --- Section 1: every Loop order since the last report --------------------
+  const { rows: lastRun } = await pool.query('SELECT MAX(ran_at) AS last_run FROM alert_digest_runs');
+  const since = lastRun[0]?.last_run || null;
+
+  const orderRows = since
+    ? await pool.query(
+        `SELECT DISTINCT order_id FROM orders_to_enrich
+          WHERE source = 'loop' AND created_at >= $1
+          ORDER BY order_id`,
+        [since]
+      )
+    : await pool.query(
+        `SELECT DISTINCT order_id FROM orders_to_enrich
+          WHERE source = 'loop' AND created_at >= NOW() - ($1::int * INTERVAL '1 hour')
+          ORDER BY order_id`,
+        [FIRST_RUN_HOURS]
+      );
+
+  console.log(
+    `[alert-digest] checking ${orderRows.rows.length} Loop order(s) since ` +
+      (since ? new Date(since).toISOString() : `${FIRST_RUN_HOURS}h ago (first run)`)
+  );
+
+  const orderStatuses = [];
+  for (const row of orderRows.rows) {
+    let order;
+    try {
+      order = (await getOrder(row.order_id))?.order;
+    } catch (err) {
+      orderStatuses.push({
+        orderId: row.order_id,
+        orderName: null,
+        status: 'error',
+        label: `could not check — ${err.message.split('\n')[0]}`,
+      });
+      continue;
+    }
+    if (!order) continue; // deleted since being queued — nothing to report
+
+    const c = classifyOrder(order);
+    orderStatuses.push({ orderId: row.order_id, orderName: order.name, status: c.status, label: c.label });
+  }
+
+  const byStatus = orderStatuses.reduce((acc, o) => {
+    acc[o.status] = (acc[o.status] || 0) + 1;
+    return acc;
+  }, {});
+  console.log(`[alert-digest] section 1: ${JSON.stringify(byStatus)}`);
+
+  // --- Section 2: genuinely stuck on a withdrawn weekday (wider window) -----
+  const { rows: stuckCandidates } = await pool.query(
     `SELECT DISTINCT ON (COALESCE(subscription_id::text, order_id::text))
         order_id, subscription_id
        FROM orders_to_enrich
@@ -168,14 +236,10 @@ async function runDigest() {
     [HOURS]
   );
 
-  console.log(`[alert-digest] verifying ${rows.length} candidate(s) against Shopify + HDS...`);
+  console.log(`[alert-digest] section 2: verifying ${stuckCandidates.length} candidate(s) against Shopify + HDS...`);
 
   const stuckOrders = [];
-  let fixed = 0;
-  let other = 0;
-  let skipped = 0;
-
-  for (const row of rows) {
+  for (const row of stuckCandidates) {
     const result = await checkOrder(row.order_id);
     if (result.verdict === 'stuck') {
       stuckOrders.push({
@@ -184,48 +248,30 @@ async function runDigest() {
         subscriptionId: row.subscription_id,
         detail: result.detail,
       });
-    } else if (result.verdict === 'fixed') {
-      fixed += 1;
-    } else if (result.verdict === 'other') {
-      other += 1;
-    } else {
-      skipped += 1;
     }
   }
 
+  const newStuck = await filterAlreadyNotified(pool, stuckOrders);
+  const suppressed = stuckOrders.length - newStuck.length;
   console.log(
-    `[alert-digest] ${stuckOrders.length} genuinely stuck, ${fixed} already fixed, ${other} other cause, ${skipped} skipped`
+    `[alert-digest] section 2: ${stuckOrders.length} genuinely stuck` +
+      (suppressed ? `, ${suppressed} already reported within ${DEDUPE_HOURS}h — not repeating` : '')
   );
 
-  // Drop anything already reported within the dedupe window — this run only
-  // ever adds NEW ground to cover, not the same lines again.
-  const newOrders = await filterAlreadyNotified(pool, stuckOrders);
-  const suppressed = stuckOrders.length - newOrders.length;
-  if (suppressed) {
-    console.log(`[alert-digest] ${suppressed} of those already reported within the last ${DEDUPE_HOURS}h — not repeating`);
-  }
-
-  const email = buildDigestEmail(newOrders);
-  if (!email) {
-    console.log(`[alert-digest] nothing new to report in the last ${HOURS}h — no email sent`);
-    return { sent: false, count: 0 };
-  }
+  // --- Always send, "all clear" included -------------------------------------
+  const email = buildReportEmail(orderStatuses, newStuck);
 
   if (!isConfigured()) {
-    console.log(
-      `[alert-digest] ${newOrders.length} order(s) stuck, but SMTP is not configured — would have sent:\n` +
-        `  subject: ${email.subject}`
-    );
-    return { sent: false, count: newOrders.length };
+    console.log(`[alert-digest] SMTP is not configured — would have sent:\n  subject: ${email.subject}\n\n${email.text}`);
+  } else {
+    const result = await sendMail(email);
+    console.log(`[alert-digest] emailed ${result.to.join(', ')} — ${email.subject}`);
   }
 
-  const result = await sendMail(email);
-  console.log(`[alert-digest] ${newOrders.length} order(s) stuck — emailed ${result.to.join(', ')}`);
-  // Recorded only once actually reported, so a failed send (thrown above,
-  // never reaching here) gets a genuine retry next pass instead of being
-  // silently suppressed for having "already" been sent.
-  await markNotified(pool, newOrders);
-  return { sent: true, count: newOrders.length };
+  if (newStuck.length) await markNotified(pool, newStuck);
+  await pool.query('INSERT INTO alert_digest_runs (ran_at) VALUES (NOW())');
+
+  return { sent: isConfigured(), orderCount: orderStatuses.length, stuckCount: newStuck.length };
 }
 
 // Of these stuck orders, which have NOT already been reported within
@@ -285,7 +331,7 @@ function initAlertDigest() {
     const delay = msUntilNextOccurrence(DIGEST_TIMES_UTC);
     console.log(
       `[alert-digest] started (daily at ${label} UTC, first run in ${Math.round(delay / 60000)}m, ` +
-        `looking back ${HOURS}h, ${smtpNote})`
+        `looking back ${HOURS}h for section 2, ${smtpNote})`
     );
     // Re-scheduled after each run rather than fixed setIntervals, so a
     // long-running process can't drift off the target times, and so several
@@ -299,10 +345,17 @@ function initAlertDigest() {
   } else {
     console.log(
       `[alert-digest] started (every ${Math.round(INTERVAL_MS / 3600000)}h from boot — set ` +
-        `ALERT_DIGEST_TIMES_UTC for fixed daily times instead, looking back ${HOURS}h, ${smtpNote})`
+        `ALERT_DIGEST_TIMES_UTC for fixed daily times instead, looking back ${HOURS}h for section 2, ${smtpNote})`
     );
     setInterval(runOnce, INTERVAL_MS);
   }
 }
 
-module.exports = { initAlertDigest, runDigest, buildDigestEmail, msUntilNextHour, msUntilNextOccurrence, parseHHMM };
+module.exports = {
+  initAlertDigest,
+  runDigest,
+  buildReportEmail,
+  msUntilNextHour,
+  msUntilNextOccurrence,
+  parseHHMM,
+};
