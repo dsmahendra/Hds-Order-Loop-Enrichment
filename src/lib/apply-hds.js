@@ -16,7 +16,7 @@
 //   3. HDS fields missing           add them around the existing date. Additive.
 //   4. tags missing                 add them. Needs no HDS call.
 
-const { getNoteAttribute } = require('../shopify');
+const { getNoteAttribute, normalizeDate } = require('../shopify');
 const { updateOrderAttributes } = require('../shopify');
 const {
   needsRewrite,
@@ -36,6 +36,46 @@ function hasDeliveryDate(order) {
   return Boolean(
     getNoteAttribute(order, 'Delivery-Date') || getNoteAttribute(order, 'HDS Delivery Date')
   );
+}
+
+// A pack date can be technically PRESENT and still wrong. Loop copies the
+// subscription's entire attribute set verbatim onto every renewal, so an
+// order can arrive with every HDS_FIELD non-empty — internally consistent
+// with itself, but all of it frozen at the very first cycle. pendingHdsFields
+// only ever sees "missing", never "present but no longer true", so an order
+// like that used to reach planFor() looking complete and stay that way
+// forever, until someone happened to notice the pack date made no sense.
+// Cheap: reads the order's own attributes, no API call — the actual
+// recompute, if this finds something, still goes through fillHdsRecords like
+// any other fill.
+function packDateStaleness(order) {
+  const packRaw =
+    getNoteAttribute(order, 'Pick-Pack-Date') ||
+    getNoteAttribute(order, 'HDS Ship Date') ||
+    getNoteAttribute(order, 'HDS Pack Date');
+  if (!packRaw) return null;
+  const packIso = normalizeDate(packRaw);
+
+  const todayIso = new Date().toISOString().slice(0, 10);
+  if (packIso <= todayIso) return `Pick-Pack-Date ${packIso} is on or before today`;
+
+  const deliveryRaw = getNoteAttribute(order, 'Delivery-Date') || getNoteAttribute(order, 'HDS Delivery Date');
+  if (deliveryRaw) {
+    const deliveryIso = normalizeDate(deliveryRaw);
+    if (packIso >= deliveryIso) {
+      return `Pick-Pack-Date ${packIso} is not before the delivery date ${deliveryIso}`;
+    }
+  }
+
+  // Two names for the same fact (see renewal-rewrite.js's fillHdsRecords) —
+  // if they disagree, at least one of them is wrong.
+  const pickRaw = getNoteAttribute(order, 'Pick-Pack-Date');
+  const shipRaw = getNoteAttribute(order, 'HDS Ship Date');
+  if (pickRaw && shipRaw && normalizeDate(pickRaw) !== normalizeDate(shipRaw)) {
+    return `Pick-Pack-Date ${normalizeDate(pickRaw)} and HDS Ship Date ${normalizeDate(shipRaw)} disagree`;
+  }
+
+  return null;
 }
 
 // What would happen, without doing it. Cheap — no API calls.
@@ -62,6 +102,12 @@ function planFor(order) {
   if (pending.length) {
     return { action: 'fill', reason: `${pending.length} HDS field(s) missing`, pending };
   }
+
+  const staleness = packDateStaleness(order);
+  if (staleness) {
+    return { action: 'fill', reason: staleness, recompute: true };
+  }
+
   return { action: 'tags-only', reason: 'dates are complete' };
 }
 
@@ -96,7 +142,10 @@ async function applyHdsToOrder(
     result.resolved = out.resolved;
     result.tagsAdded = out.tags || [];
   } else if (plan.action === 'fill') {
-    const out = await fillHdsRecords(order, { dryRun, overwrite: recompute });
+    // planFor() itself asks for overwrite when it found a pack date that's
+    // present but wrong (plan.recompute) — the caller didn't have to know to
+    // ask for that; it falls out of what's actually broken.
+    const out = await fillHdsRecords(order, { dryRun, overwrite: recompute || Boolean(plan.recompute) });
     if (!out.ok) return { ...result, ok: false, reason: out.reason };
     result.wrote = out.attributes;
     result.resolved = out.resolved;
@@ -140,4 +189,4 @@ async function applyHdsToOrder(
   return { ...result, ok: true, dryRun };
 }
 
-module.exports = { applyHdsToOrder, planFor, rewriteEnabled, hasDeliveryDate };
+module.exports = { applyHdsToOrder, planFor, rewriteEnabled, hasDeliveryDate, packDateStaleness };
