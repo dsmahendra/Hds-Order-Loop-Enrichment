@@ -632,7 +632,10 @@ const HAND_ENTERED = {
   id: 1,
   created_at: '2026-09-03T22:50:00+10:00',
   shipping_address: { city: 'Carrum', zip: '3197' },
-  ...attrs({ 'Delivery-Date': slash(FUTURE_FRIDAY), 'Pick-Pack-Date': '2026/09/05' }),
+  // HDS Ship Date present too (not just Pick-Pack-Date) so this represents a
+  // fully hand-set, complete record — distinct from the genuinely incomplete
+  // case (only Pick-Pack-Date present) the pack-date-sync fix targets below.
+  ...attrs({ 'Delivery-Date': slash(FUTURE_FRIDAY), 'Pick-Pack-Date': '2026/09/05', 'HDS Ship Date': '2026/09/05' }),
 };
 
 test('overwrite replaces a pack date that was set by hand', async () => {
@@ -857,6 +860,60 @@ test('a stale kept date replaces the WHOLE HDS set, not just Delivery-Date, even
     assert.equal(out.attributes['HDS Region'], 'VIC Melbourne Metro');
     assert.equal(out.attributes['HDS Suburb'], 'CARRUM');
     assert.notEqual(out.attributes['HDS Cutoff Date'], slash(daysFromNow(-23)), 'the old cutoff must not survive');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Pick-Pack-Date and HDS Ship Date move together even when only one is missing', async () => {
+  // WM142754 in production: the order carried a stale Pick-Pack-Date (Loop's
+  // copy of the subscription's frozen first-cycle value) but no HDS Ship
+  // Date at all. additiveOnly() correctly filled the missing HDS Ship Date
+  // fresh (2026/09/16) but left Pick-Pack-Date exactly as stale as it was
+  // (2026/09/02) purely because it already had SOME value — two keys that
+  // are supposed to be the same fact then disagreed with each other. Not a
+  // stale-kept-date case (Delivery-Date itself is fine, future, not stale):
+  // this is the plain additive fill path every webhook run actually uses.
+  const futureDelivery = daysFromNow(4);
+  const wanted = weekdayOfDate(futureDelivery);
+  const freshPack = daysFromNow(2);
+  const freshProduction = daysFromNow(1);
+
+  const schedule = [
+    {
+      schedule_id: 178,
+      delivery_day: wanted,
+      delivery_window: 'Business Hours',
+      cutoff_info: 'Monday 11 PM',
+      delivery_date: futureDelivery,
+      pack_date: freshPack,
+      production_date: freshProduction,
+    },
+  ];
+
+  const order = {
+    id: 8,
+    created_at: `${daysFromNow(0)}T13:00:00+10:00`,
+    shipping_address: { city: 'Carrum', zip: '3197' },
+    // Only Pick-Pack-Date pre-exists (stale) — HDS Ship Date and everything
+    // else is genuinely missing, matching a fresh Loop renewal that copied
+    // just that one attribute from the subscription.
+    ...attrs({ 'Delivery-Date': slash(futureDelivery), 'Pick-Pack-Date': slash(daysFromNow(-12)) }),
+  };
+
+  const originalFetch = global.fetch;
+  clearDeliveryOptionsCache();
+  global.fetch = stubHds(schedule);
+  try {
+    const out = await fillHdsRecords(order, { dryRun: true }); // no --overwrite
+
+    assert.equal(out.ok, true, out.reason);
+    assert.equal(out.attributes['HDS Ship Date'], slash(freshPack));
+    assert.equal(
+      out.attributes['Pick-Pack-Date'],
+      slash(freshPack),
+      'Pick-Pack-Date must be corrected alongside HDS Ship Date, not left stale'
+    );
   } finally {
     global.fetch = originalFetch;
   }

@@ -876,6 +876,25 @@ async function fillHdsRecords(order, { dryRun = false, overwrite = false } = {})
     // be. So a stale kept date replaces the WHOLE built set, not just one key.
     let attributes = packIsStale ? built : overwrite ? built : additiveOnly(order, built);
 
+    // Pick-Pack-Date and HDS Ship Date are two names for the exact same fact
+    // — buildOrderAttributes always computes them as the same value. Plain
+    // additiveOnly() treats each key independently: if one was already
+    // present (even with a stale, wrong value — e.g. Loop's copy of the
+    // subscription's own Pick-Pack-Date, frozen at the first cycle) while the
+    // other was missing, it wrote the missing one fresh and left the other
+    // exactly as wrong as it was. Real order: HDS Ship Date correctly landed
+    // on 2026/09/16 while Pick-Pack-Date stayed at 2026/09/02 — two systems
+    // reading "the same fact" then disagreeing with each other, which is
+    // worse than either alone. If either is being corrected, so is its pair.
+    if (!packIsStale && !overwrite && built['Pick-Pack-Date']) {
+      const PACK_DATE_KEYS = ['Pick-Pack-Date', 'HDS Ship Date'];
+      const changing = PACK_DATE_KEYS.some((k) => k in attributes);
+      const holding = PACK_DATE_KEYS.some((k) => !(k in attributes) && getNoteAttribute(order, k));
+      if (changing && holding) {
+        for (const k of PACK_DATE_KEYS) attributes[k] = built[k];
+      }
+    }
+
     if (scope === 'pack-date') {
       // Just the one key NetSuite reads — but a stale kept date still needs
       // Delivery-Date corrected alongside it, or the two describe different
