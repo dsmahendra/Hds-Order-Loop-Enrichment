@@ -16,33 +16,58 @@ const { HELD_TAG } = require('../src/lib/renewal-rewrite');
 
 const attrs = (pairs) => Object.entries(pairs).map(([name, value]) => ({ name, value }));
 
+// Computed relative to whenever the suite actually runs, not fixed 2026
+// literals — planFor's staleness check (Pick-Pack-Date must be before today
+// AND before Delivery-Date) means a fixed-in-the-past fixture eventually
+// starts failing on its own once real time catches up to it.
+function daysFromNow(n) {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() + n);
+  return d;
+}
+const slash = (d) => d.toISOString().slice(0, 10).replace(/-/g, '/');
+const ddmmyyyy = (d) => {
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  return `${day}-${m}-${y}`;
+};
+
+const CREATED_AT = daysFromNow(-3);
+const DELIVERY = daysFromNow(10);
+const PACK = daysFromNow(9);
+const PRODUCTION = daysFromNow(8);
+const CUTOFF = daysFromNow(6);
+const EXPIRED = daysFromNow(-30); // safely before CREATED_AT too
+
 // Everything the HDS set contributes, as a fully enriched order carries it.
 const COMPLETE_HDS = {
-  'Delivery-Date': '2026/09/07',
-  'Pick-Pack-Date': '2026/09/06',
-  'HDS Delivery Date': '2026/09/07',
-  'HDS Delivery Formatted': 'Monday, 7 September 2026',
+  'Delivery-Date': slash(DELIVERY),
+  'Pick-Pack-Date': slash(PACK),
+  'HDS Delivery Date': slash(DELIVERY),
+  'HDS Delivery Formatted': 'Some Formatted Date',
   'HDS Delivery Day': 'Monday',
   'HDS Delivery Window': 'AM',
   'Delivery-Time': '12:00 AM - 7:00 AM',
   'HDS Schedule ID': '12',
   'HDS Cutoff Day': 'Friday',
-  'HDS Cutoff Date': '2026/09/04',
+  'HDS Cutoff Date': slash(CUTOFF),
   'Charge Offset': '3 Days',
-  'HDS Ship Date': '2026/09/06',
-  'HDS Production Date': '2026/09/05',
+  'HDS Ship Date': slash(PACK),
+  'HDS Production Date': slash(PRODUCTION),
   'HDS Region': 'NSW',
   'HDS Suburb': 'Marrickville',
   'HDS Postcode': '2204',
 };
 
 // The date tags that follow from those dates.
-const COMPLETE_TAGS = '07-09-2026, Pick-Pack-Date-06-09-2026';
+const PACK_TAG = `Pick-Pack-Date-${ddmmyyyy(PACK)}`;
+const COMPLETE_TAGS = `${ddmmyyyy(DELIVERY)}, ${PACK_TAG}`;
 
 const orderWith = (overrides = {}) => ({
   id: 1,
   name: 'WM141238',
-  created_at: '2026-09-04T16:07:00+10:00',
+  created_at: `${CREATED_AT.toISOString().slice(0, 10)}T16:07:00+10:00`,
   tags: COMPLETE_TAGS,
   note_attributes: attrs(COMPLETE_HDS),
   ...overrides,
@@ -82,7 +107,7 @@ test('complete dates but missing tags is caught, without asking Loop', () => {
   assert.ok(work);
   assert.strictEqual(work.plan.action, 'tags-only');
   assert.match(work.why, /missing tag/);
-  assert.match(work.why, /Pick-Pack-Date-06-09-2026/);
+  assert.match(work.why, new RegExp(PACK_TAG));
 });
 
 test('complete dates and tags but missing Delivery-Time is caught', () => {
@@ -99,9 +124,9 @@ test('complete dates and tags but missing Delivery-Time is caught', () => {
 });
 
 test('a partially tagged order is caught on the tag it lacks', () => {
-  const work = needsWork(orderWith({ tags: '07-09-2026' }));
+  const work = needsWork(orderWith({ tags: ddmmyyyy(DELIVERY) }));
   assert.ok(work);
-  assert.match(work.why, /Pick-Pack-Date-06-09-2026/);
+  assert.match(work.why, new RegExp(PACK_TAG));
 });
 
 test('an unrelated tag does not make an untagged order look tagged', () => {
@@ -115,8 +140,8 @@ test('an order held for expired dates is reported, not forced', () => {
   // hold exists to prevent, and it is already visible by its tag.
   const stale = {
     ...COMPLETE_HDS,
-    'Delivery-Date': '2026/08/01',
-    'HDS Delivery Date': '2026/08/01',
+    'Delivery-Date': slash(EXPIRED),
+    'HDS Delivery Date': slash(EXPIRED),
   };
   const held = orderWith({ note_attributes: attrs(stale), tags: `${COMPLETE_TAGS}, ${HELD_TAG}` });
 
@@ -135,8 +160,8 @@ test('an order held for expired dates is reported, not forced', () => {
 test('an expired date IS rewritten when rewriting is enabled', () => {
   const stale = {
     ...COMPLETE_HDS,
-    'Delivery-Date': '2026/08/01',
-    'HDS Delivery Date': '2026/08/01',
+    'Delivery-Date': slash(EXPIRED),
+    'HDS Delivery Date': slash(EXPIRED),
   };
   const saved = process.env.REWRITE_RENEWAL_DATES;
   try {
