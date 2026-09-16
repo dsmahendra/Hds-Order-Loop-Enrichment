@@ -26,7 +26,8 @@ const {
 const { missingTags, taggingEnabled, hasSellingPlan } = require('../lib/order-tags');
 const { buildHdsAttributes } = require('../lib/renewal-date');
 const { legacyLabelUpdates, describeUpdates, isEnabled: renameEnabled } = require('../lib/legacy-labels');
-const { updateOrderAttributes } = require('../shopify');
+const { notifyOrderStatus, isEnabled: perOrderEmailEnabled } = require('../lib/order-notify');
+const { updateOrderAttributes, getOrder } = require('../shopify');
 
 // Recompute stale renewal dates and write them back onto the order — the job
 // Arigato Automation was doing. Set REWRITE_RENEWAL_DATES=false to stand this
@@ -324,6 +325,20 @@ router.post('/shopify/orders/create', async (req, res) => {
     }
   }
 
+  // Everything below is an ADDITIVE decision (tags to add, an attribute to
+  // default, a label to rename) computed purely from the `order` payload
+  // already in hand — none of them depends on another's result. They used to
+  // fire as up to four separate Shopify PUTs per order, each waiting its turn
+  // on the single global rate-limited queue in shopify.js. That's cheap for
+  // one order and expensive for twenty landing in the same minute (a Loop
+  // renewal batch), where it was the difference between the write happening
+  // in-window and it still being queued behind everyone else's calls when the
+  // next burst arrived. Collected here and sent as ONE PUT instead.
+  let tailAttributes = {};
+  let tailRemoveAttributes = [];
+  let tailAddTags = [];
+  const tailNotes = [];
+
   // An order that arrived already complete — a normal checkout order, where the
   // extension has written the whole HDS set — triggers neither the rewrite nor the
   // fill, and so was getting no tags at all. Arigato and Zapiet used to tag those
@@ -350,13 +365,8 @@ router.post('/shopify/orders/create', async (req, res) => {
     // still describes this order.
     const missing = missingTags(order, tagContext, { atCreation: true });
     if (missing.length) {
-      try {
-        await updateOrderAttributes(orderId, { addTags: missing, order });
-        console.log(`[webhook] order ${orderId}: tags added — ${missing.join(', ')}`);
-      } catch (err) {
-        hdsWriteOk = false;
-        console.warn(`[webhook] order ${orderId}: could not add tags — ${describeError(err)}`);
-      }
+      tailAddTags.push(...missing);
+      tailNotes.push(`tags added — ${missing.join(', ')}`);
     }
   }
 
@@ -368,33 +378,16 @@ router.post('/shopify/orders/create', async (req, res) => {
   // needed: the default is a fixed clock range, not something derived from the
   // schedule.
   if (!rewritten && !filled && !getNoteAttribute(order, 'Delivery-Time')) {
-    try {
-      await updateOrderAttributes(orderId, {
-        attributes: { 'Delivery-Time': DEFAULT_DELIVERY_TIME },
-        order,
-      });
-      console.log(`[webhook] order ${orderId}: Delivery-Time defaulted to ${DEFAULT_DELIVERY_TIME}`);
-    } catch (err) {
-      console.warn(`[webhook] order ${orderId}: could not default Delivery-Time — ${describeError(err)}`);
-    }
+    tailAttributes['Delivery-Time'] = DEFAULT_DELIVERY_TIME;
+    tailNotes.push(`Delivery-Time defaulted to ${DEFAULT_DELIVERY_TIME}`);
   }
 
   // The order still shows the expired dates, and nothing on the order page says so.
   // Tag it, so ops and fulfilment can see the dates are not to be trusted instead of
   // reading a plausible-looking date that has already passed.
   if (rewriteFailed) {
-    try {
-      await updateOrderAttributes(orderId, { addTags: [HELD_TAG], order });
-      // One searchable tag across every job (this one, the retry job, the
-      // sweep) is what lets "is anything broken right now" be answered by a
-      // single log search instead of knowing each job's own prefix.
-      console.warn(
-        `[ALERT][webhook] order ${orderId}: tagged ${HELD_TAG} — dates left as they arrived, needs a manual fix ` +
-          `(node src/scripts/order-fix.js --order ${orderId})`
-      );
-    } catch (err) {
-      console.warn(`[webhook] order ${orderId}: could not tag ${HELD_TAG} — ${describeError(err)}`);
-    }
+    tailAddTags.push(HELD_TAG);
+    tailNotes.push(`tagged ${HELD_TAG} — dates left as they arrived, needs a manual fix`);
   }
 
   // A rewritten order already carries the new labels: the rewrite replaces that
@@ -404,15 +397,49 @@ router.post('/shopify/orders/create', async (req, res) => {
   if (!rewritten && renameEnabled()) {
     const updates = legacyLabelUpdates(order);
     if (updates) {
-      try {
-        await updateOrderAttributes(orderId, {
-          attributes: updates.attributes,
-          removeAttributes: updates.remove,
-          order,
-        });
-        console.log(`[webhook] order ${orderId}: labels renamed — ${describeUpdates(updates)}`);
-      } catch (err) {
-        console.warn(`[webhook] order ${orderId}: label rename failed — ${describeError(err)}`);
+      Object.assign(tailAttributes, updates.attributes);
+      tailRemoveAttributes.push(...updates.remove);
+      tailNotes.push(`labels renamed — ${describeUpdates(updates)}`);
+    }
+  }
+
+  // Include the rewritten/filled HDS attributes if the rewrite or fill succeeded.
+  // These were computed above but only stored in the database — they must also be
+  // written to Shopify on the FIRST pass, not deferred to the queue processor, to
+  // avoid a second run re-processing and potentially deleting them.
+  const allAttributes = { ...tailAttributes };
+  if ((rewritten || filled) && effectiveAttributes) {
+    Object.assign(allAttributes, effectiveAttributes);
+  }
+
+  if (tailAddTags.length || tailRemoveAttributes.length || Object.keys(allAttributes).length) {
+    try {
+      await updateOrderAttributes(orderId, {
+        attributes: allAttributes,
+        addTags: tailAddTags,
+        removeAttributes: tailRemoveAttributes,
+        order,
+      });
+      for (const note of tailNotes) console.log(`[webhook] order ${orderId}: ${note}`);
+      if (rewriteFailed) {
+        // One searchable tag across every job (this one, the retry job, the
+        // sweep) is what lets "is anything broken right now" be answered by a
+        // single log search instead of knowing each job's own prefix.
+        console.warn(
+          `[ALERT][webhook] order ${orderId}: tagged ${HELD_TAG} — dates left as they arrived, needs a manual fix ` +
+            `(node src/scripts/order-fix.js --order ${orderId})`
+        );
+      }
+    } catch (err) {
+      hdsWriteOk = false;
+      console.warn(
+        `[webhook] order ${orderId}: could not apply (${tailNotes.join('; ') || 'pending updates'}) — ${describeError(err)}`
+      );
+      if (rewriteFailed) {
+        console.warn(
+          `[ALERT][webhook] order ${orderId}: could not tag ${HELD_TAG} either — dates left as they arrived, ` +
+            `needs a manual fix (node src/scripts/order-fix.js --order ${orderId})`
+        );
       }
     }
   }
@@ -561,6 +588,21 @@ router.post('/shopify/orders/create', async (req, res) => {
       );
     } catch (err) {
       console.warn(`[webhook] could not link order ${orderId} to subscription:`, describeError(err));
+    }
+  }
+
+  // Real-time per-order status email — opt-in (PER_ORDER_EMAIL_ENABLED),
+  // additive to the periodic digest. Checked before the extra GET below so a
+  // store that hasn't turned this on pays nothing for it. Fetches the order
+  // fresh rather than classifying the original webhook payload, since
+  // everything above (rewrite/fill/tags) has written to the order by now and
+  // this local `order` variable was never updated to reflect it.
+  if (source === 'loop' && perOrderEmailEnabled()) {
+    try {
+      const fresh = (await getOrder(orderId))?.order || order;
+      await notifyOrderStatus(fresh);
+    } catch (err) {
+      console.warn(`[webhook] order ${orderId}: per-order email failed — ${describeError(err)}`);
     }
   }
 });
