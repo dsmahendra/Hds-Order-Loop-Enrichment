@@ -25,10 +25,19 @@ function verifyWebhook(rawBody, hmacHeader) {
 }
 
 // Read a note attribute value by name from a Shopify order payload.
+// Accepts both capitalized keys ("Pick-Pack-Date", "HDS Region") and lowercase
+// snake_case ("hds_pack_date", "hds_region") — the checkout extension writes
+// lowercase, our system writes capitalized, both should be found.
 function getNoteAttribute(order, name) {
   const attrs = order?.note_attributes || [];
-  const hit = attrs.find((a) => a?.name === name);
-  return hit ? hit.value : null;
+  // Try exact match first (capitalized)
+  let hit = attrs.find((a) => a?.name === name);
+  if (hit) return hit.value;
+  // Fall back to lowercase snake_case variant
+  const snakeCase = name.toLowerCase().replace(/\s+/g, '_').replace(/-/g, '_');
+  hit = attrs.find((a) => a?.name === snakeCase);
+  if (hit) return hit.value;
+  return null;
 }
 
 // The checkout extension writes the detailed HDS set with human-readable labels
@@ -105,7 +114,12 @@ function describeAdminToken(token) {
 // calls at least MIN_GAP_MS apart. A burst QUEUES instead of failing. It is
 // slower per order and completely indifferent to how many arrive at once, which
 // is the right trade when the alternative is a missing pack date.
-const MIN_GAP_MS = Number(process.env.SHOPIFY_MIN_GAP_MS || 550);
+//
+// 260ms (~3.85/s) assumes a Shopify PLUS store (4/s sustained, shared across
+// every endpoint on one token — unlike Loop's per-endpoint bucket below, so
+// there's no per-path ceiling to worry about here). On standard Shopify (2/s)
+// set SHOPIFY_MIN_GAP_MS=550 instead, or this queue will draw 429s under load.
+const MIN_GAP_MS = Number(process.env.SHOPIFY_MIN_GAP_MS || 260);
 
 // 429 and 5xx both deserve another go: the first means "too fast", the second is
 // Shopify being briefly unavailable. Other 4xx do not — a wrong token or a
