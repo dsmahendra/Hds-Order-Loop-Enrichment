@@ -207,12 +207,16 @@ function buildOrderAttributes(resolved, { preferredWindow = null, existingDelive
   const deliveryTime = timeRangeForWindow(window) || (existingDeliveryTime ? null : DEFAULT_DELIVERY_TIME);
 
   const out = {
-    // What the downstream integration reads.
+    // Priority 1: Delivery dates
     'Delivery-Date': toSlashDate(resolved.delivery_date),
-    'Pick-Pack-Date': toSlashDate(resolved.pack_date),
-    'Delivery-Time': deliveryTime,
-    // The labelled HDS set, as the checkout extension writes it.
     'HDS Delivery Date': toSlashDate(resolved.delivery_date),
+    // Priority 2: Pick and pack dates
+    'Pick-Pack-Date': toSlashDate(resolved.pack_date),
+    'HDS Ship Date': toSlashDate(resolved.pack_date),
+    // Priority 3: Production date
+    'HDS Production Date': toSlashDate(resolved.production_date),
+    // Remaining attributes
+    'Delivery-Time': deliveryTime,
     'HDS Delivery Formatted': resolved.formatted_date,
     'HDS Delivery Day': resolved.delivery_day,
     'HDS Delivery Window': window,
@@ -220,8 +224,6 @@ function buildOrderAttributes(resolved, { preferredWindow = null, existingDelive
     'HDS Cutoff Day': cutoff.cutoff_day,
     'HDS Cutoff Date': toSlashDate(cutoff.cutoff_date),
     'Charge Offset': cutoff.charge_offset_days == null ? null : `${cutoff.charge_offset_days} Days`,
-    'HDS Ship Date': toSlashDate(resolved.pack_date),
-    'HDS Production Date': toSlashDate(resolved.production_date),
     'HDS Region': resolved.region,
     'HDS Suburb': resolved.suburb,
     'HDS Postcode': resolved.postcode,
