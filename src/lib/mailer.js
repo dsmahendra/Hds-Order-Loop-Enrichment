@@ -20,6 +20,13 @@ function config() {
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean),
+    // Optional and separate from `to`: a BCC list gets every alert email (the
+    // digest AND the per-order notification) without appearing on it, and
+    // without needing its own ALERT_EMAIL_TO entry per person watching along.
+    bcc: String(process.env.ALERT_EMAIL_BCC || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
   };
 }
 
@@ -57,10 +64,11 @@ async function sendMail({ subject, text }) {
   await transport().sendMail({
     from: c.from,
     to: c.to.join(', '),
+    ...(c.bcc.length ? { bcc: c.bcc.join(', ') } : {}),
     subject,
     text,
   });
-  return { sent: true, to: c.to };
+  return { sent: true, to: c.to, bcc: c.bcc };
 }
 
 module.exports = { isConfigured, sendMail, config };

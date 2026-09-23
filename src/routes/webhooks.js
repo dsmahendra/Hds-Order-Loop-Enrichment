@@ -28,6 +28,7 @@ const { buildHdsAttributes } = require('../lib/renewal-date');
 const { legacyLabelUpdates, describeUpdates, isEnabled: renameEnabled } = require('../lib/legacy-labels');
 const { notifyOrderStatus, isEnabled: perOrderEmailEnabled } = require('../lib/order-notify');
 const { updateOrderAttributes, getOrder } = require('../shopify');
+const { sendMail, isConfigured: emailConfigured } = require('../lib/mailer');
 
 // Recompute stale renewal dates and write them back onto the order — the job
 // Arigato Automation was doing. Set REWRITE_RENEWAL_DATES=false to stand this
@@ -363,7 +364,8 @@ router.post('/shopify/orders/create', async (req, res) => {
 
     // atCreation: the webhook runs the moment the order exists, so the cycle count
     // still describes this order.
-    const missing = missingTags(order, tagContext, { atCreation: true });
+    // onlyIfMissing: prevent duplicate pack date tags on subsequent enrichment attempts
+    const missing = missingTags(order, tagContext, { atCreation: true, onlyIfMissing: true });
     if (missing.length) {
       tailAddTags.push(...missing);
       tailNotes.push(`tags added — ${missing.join(', ')}`);
@@ -495,6 +497,31 @@ router.post('/shopify/orders/create', async (req, res) => {
       console.warn(
         `[webhook] order ${orderId}: HDS data incomplete — flagged for the retry job`
       );
+      // Send email alert for failed/incomplete orders
+      if (emailConfigured()) {
+        try {
+          const reason = errorMessage || 'Unknown reason';
+          await sendMail({
+            subject: `Order Enrichment Failed: ${order.name || orderId}`,
+            text: `Order: ${order.name || orderId} (ID: ${orderId})
+Created: ${order.created_at}
+Status: ${status}
+Source: ${source}
+
+Reason for failure:
+${reason}
+
+Please investigate and resolve using:
+node src/scripts/order-fix.js --name ${order.name || orderId}
+
+Store: ${process.env.SHOPIFY_STORE || 'unknown'}`,
+          });
+        } catch (emailErr) {
+          console.warn(
+            `[webhook] order ${orderId}: failed to send email alert — ${describeError(emailErr)}`
+          );
+        }
+      }
     }
 
     if (status === 'pending') {

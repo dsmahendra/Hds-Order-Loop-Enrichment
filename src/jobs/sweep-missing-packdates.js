@@ -26,7 +26,7 @@ const { applyHdsToOrder, planFor } = require('../lib/apply-hds');
 const { HELD_TAG } = require('../lib/renewal-rewrite');
 const { missingTags, taggingEnabled } = require('../lib/order-tags');
 
-const INTERVAL_MS = Number(process.env.SWEEP_INTERVAL_MS || 30 * 60 * 1000);
+const INTERVAL_MS = Number(process.env.SWEEP_INTERVAL_MS || 15 * 60 * 1000);
 const WINDOW_HOURS = Number(process.env.SWEEP_HOURS || 24);
 
 // An order created seconds ago is probably still in the webhook handler. Fixing
@@ -36,8 +36,10 @@ const MIN_AGE_MINUTES = Number(process.env.SWEEP_MIN_AGE_MINUTES || 10);
 
 // A bound on one pass. If something systemic broke and hundreds of orders need
 // fixing, repairing them over several passes is better than spending the whole
-// rate limit at once and starving the live webhooks.
-const MAX_FIXES = Number(process.env.SWEEP_MAX_FIXES || 25);
+// rate limit at once and starving the live webhooks. Raised alongside a shorter
+// interval (was 25/30min) so a renewal-burst-sized backlog clears within the
+// hour instead of still being there next morning.
+const MAX_FIXES = Number(process.env.SWEEP_MAX_FIXES || 50);
 
 let running = false;
 

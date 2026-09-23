@@ -16,9 +16,13 @@ const { getOrder } = require('../shopify');
 const { applyHdsToOrder } = require('../lib/apply-hds');
 
 // Slow on purpose: this is a safety net, not the main path. The webhook handles
-// the normal case within a second of the order existing.
-const INTERVAL_MS = Number(process.env.HDS_RETRY_INTERVAL_MS || 15 * 60 * 1000);
-const BATCH = Number(process.env.HDS_RETRY_BATCH || 10);
+// the normal case within a second of the order existing. But a Loop renewal
+// burst can leave more rows behind in one go than the old 10-per-15-minutes
+// pace could clear before the next burst arrived — which is what "still
+// missing pack dates by morning" looks like — so this trickle needs enough
+// throughput to actually drain a burst-sized backlog within the hour.
+const INTERVAL_MS = Number(process.env.HDS_RETRY_INTERVAL_MS || 5 * 60 * 1000);
+const BATCH = Number(process.env.HDS_RETRY_BATCH || 25);
 const MAX_ATTEMPTS = Number(process.env.HDS_RETRY_MAX_ATTEMPTS || 6);
 
 let running = false;

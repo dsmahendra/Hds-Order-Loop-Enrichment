@@ -20,7 +20,7 @@
 
 const { sendMail, isConfigured } = require('../lib/mailer');
 const { checkOrder } = require('../lib/stuck-order-check');
-const { classifyOrder } = require('../lib/order-status');
+const { classifyOrderWithReason } = require('../lib/order-status');
 const { getOrder } = require('../shopify');
 
 const INTERVAL_MS = Number(process.env.ALERT_DIGEST_INTERVAL_MS || 24 * 60 * 60 * 1000);
@@ -215,8 +215,17 @@ async function runDigest() {
     }
     if (!order) continue; // deleted since being queued — nothing to report
 
-    const c = classifyOrder(order);
-    orderStatuses.push({ orderId: row.order_id, orderName: order.name, status: c.status, label: c.label });
+    // The WHY, not just the category — a live dry-run through the same
+    // decision order:fix/the sweep would make, so "pack date not updated"
+    // comes with "Kingston 2604: no Thursday schedule (offers ...)" attached
+    // rather than leaving that to a separate order:explain lookup.
+    const c = await classifyOrderWithReason(order);
+    orderStatuses.push({
+      orderId: row.order_id,
+      orderName: order.name,
+      status: c.status,
+      label: c.reason ? `${c.label} — ${c.reason}` : c.label,
+    });
   }
 
   const byStatus = orderStatuses.reduce((acc, o) => {
@@ -265,7 +274,11 @@ async function runDigest() {
     console.log(`[alert-digest] SMTP is not configured — would have sent:\n  subject: ${email.subject}\n\n${email.text}`);
   } else {
     const result = await sendMail(email);
-    console.log(`[alert-digest] emailed ${result.to.join(', ')} — ${email.subject}`);
+    console.log(
+      `[alert-digest] emailed ${result.to.join(', ')}` +
+        (result.bcc?.length ? ` (bcc ${result.bcc.join(', ')})` : '') +
+        ` — ${email.subject}`
+    );
   }
 
   if (newStuck.length) await markNotified(pool, newStuck);

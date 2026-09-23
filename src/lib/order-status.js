@@ -15,7 +15,7 @@
 
 const { getNoteAttribute } = require('../shopify');
 const { HDS_FIELDS } = require('./renewal-rewrite');
-const { packDateStaleness } = require('./apply-hds');
+const { packDateStaleness, applyHdsToOrder } = require('./apply-hds');
 
 const PACK_KEYS = ['Pick-Pack-Date', 'HDS Ship Date'];
 const OTHER_KEYS = HDS_FIELDS.filter((k) => !PACK_KEYS.includes(k));
@@ -46,4 +46,30 @@ function classifyOrder(order) {
   return { status: 'done', label: 'all data updated' };
 }
 
-module.exports = { classifyOrder };
+// Same classification, plus the ACTUAL reason for anything not 'done' — a
+// real dry-run through applyHdsToOrder (the exact same decision order:fix,
+// packdates:backfill and the sweep would make), not just the category. Costs
+// a Shopify/HDS lookup, so only worth it for orders classifyOrder() already
+// flagged as needing a look — every 'done' order skips this entirely.
+async function classifyOrderWithReason(order) {
+  const c = classifyOrder(order);
+  if (c.status === 'done') return c;
+
+  try {
+    const out = await applyHdsToOrder(order, { dryRun: true, atCreation: false });
+    if (!out.ok) {
+      // The precise, live answer — "Kingston 2604: no Thursday schedule
+      // (offers ...)", "no postcode on the order", etc. — not just the
+      // category classifyOrder() already gave.
+      return { ...c, reason: out.reason };
+    }
+    return {
+      ...c,
+      reason: `would resolve to Pick-Pack-Date ${out.wrote?.['Pick-Pack-Date'] || '(pending)'} once processed`,
+    };
+  } catch (err) {
+    return { ...c, reason: err.message.split('\n')[0] };
+  }
+}
+
+module.exports = { classifyOrder, classifyOrderWithReason };

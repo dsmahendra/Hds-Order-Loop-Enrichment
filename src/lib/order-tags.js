@@ -57,7 +57,8 @@ function hasSellingPlan(order) {
 }
 
 // The two date tags, read off whatever dates the order already carries.
-function dateTags(order) {
+// onlyIfMissing: only add pack date tag if it doesn't already exist (prevents duplicates on subsequent enrichments)
+function dateTags(order, { onlyIfMissing = false } = {}) {
   const delivery =
     getNoteAttribute(order, 'Delivery-Date') || getNoteAttribute(order, 'HDS Delivery Date');
   const pack =
@@ -65,10 +66,18 @@ function dateTags(order) {
     getNoteAttribute(order, 'HDS Ship Date') ||
     getNoteAttribute(order, 'HDS Pack Date');
 
-  return [
-    delivery ? deliveryDateTag(normalizeDate(delivery)) : null,
-    pack ? packDateTag(normalizeDate(pack)) : null,
-  ].filter(Boolean);
+  const deliveryTag = delivery ? deliveryDateTag(normalizeDate(delivery)) : null;
+  const packTag = pack ? packDateTag(normalizeDate(pack)) : null;
+
+  // If onlyIfMissing, only include pack tag if the order doesn't already have a Pack-Pack-Date tag
+  if (onlyIfMissing && packTag) {
+    const existingTags = String(order?.tags || '').toLowerCase();
+    if (existingTags.includes('pick-pack-date')) {
+      return [deliveryTag].filter(Boolean);
+    }
+  }
+
+  return [deliveryTag, packTag].filter(Boolean);
 }
 
 // "WEEK" + 1 -> "1 WEEK"; "WEEK" + 2 -> "2 WEEK", matching the observed casing.
@@ -112,7 +121,7 @@ function subscriptionTags(context, { atCreation = false } = {}) {
 
 // Everything the order should have, dates plus subscription.
 function tagsForOrder(order, context = null, opts = {}) {
-  return [...dateTags(order), ...subscriptionTags(context, opts)];
+  return [...dateTags(order, opts), ...subscriptionTags(context, opts)];
 }
 
 // Only the ones it does not already have. Compared case-insensitively, since

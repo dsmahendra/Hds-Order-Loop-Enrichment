@@ -20,6 +20,7 @@
     "packdates:sweep": "node src/scripts/packdates-sweep.js",
     "schedules:stuck": "node src/scripts/stuck-schedules.js",
     "alerts:digest": "node src/scripts/alert-digest-now.js",
+    "order:notify": "node src/scripts/order-notify-now.js",
     "labels:rename": "node src/scripts/labels-rename.js",
     "test": "node --test \"test/*.test.js\""
   },
