@@ -52,7 +52,12 @@ async function retryOne(row) {
   const order = (await getOrder(orderId))?.order;
   if (!order) throw new Error('order not found in Shopify');
 
-  const out = await applyHdsToOrder(order, { atCreation: false });
+  // If hds_write_ok is TRUE, the webhook already successfully wrote attributes to Shopify.
+  // On retry, do a dry-run to check/fix, but don't re-write (avoids duplicate Shopify edits and losing data).
+  // If hds_write_ok is FALSE/NULL, the webhook write failed, so attempt to write again.
+  const skipShopifyWrite = row.hds_write_ok === true || row.hds_write_ok === 1;
+
+  const out = await applyHdsToOrder(order, { atCreation: false, dryRun: skipShopifyWrite });
 
   if (!out.ok) {
     const attemptsMade = row.attempts + 1;
@@ -89,8 +94,9 @@ async function retryOne(row) {
   );
 
   const pack = out.wrote?.['Pick-Pack-Date'];
+  const writeStatus = skipShopifyWrite ? '(dry-run, no Shopify write)' : '(wrote to Shopify)';
   console.log(
-    `[retry] order ${orderId}: ${out.action}` +
+    `[retry] order ${orderId}: ${out.action} ${writeStatus}` +
       (pack ? `, pack ${pack}` : '') +
       (out.tagsAdded.length ? `, tags ${out.tagsAdded.join(', ')}` : '')
   );
