@@ -364,11 +364,26 @@ router.post('/shopify/orders/create', async (req, res) => {
 
     // atCreation: the webhook runs the moment the order exists, so the cycle count
     // still describes this order.
-    // onlyIfMissing: prevent duplicate pack date tags on subsequent enrichment attempts
-    const missing = missingTags(order, tagContext, { atCreation: true, onlyIfMissing: true });
+    // firstEnrichmentOnly: skip pack date tag on re-enrichment attempts to avoid updates
+    const missing = missingTags(order, tagContext, { atCreation: true, firstEnrichmentOnly: true });
     if (missing.length) {
       tailAddTags.push(...missing);
+      const packDateTag = missing.find((t) => t.startsWith('Pick-Pack-Date'));
+      const otherTags = missing.filter((t) => !t.startsWith('Pick-Pack-Date'));
+
+      if (packDateTag) {
+        console.log(`[webhook] order ${orderId}: pack date tag — adding ${packDateTag} (first enrichment)`);
+      }
+      if (otherTags.length) {
+        console.log(`[webhook] order ${orderId}: other tags — adding ${otherTags.join(', ')}`);
+      }
       tailNotes.push(`tags added — ${missing.join(', ')}`);
+    } else {
+      // Check if pack date tag was skipped due to re-enrichment
+      const existingTags = String(order?.tags || '').toLowerCase();
+      if (existingTags.includes('pick-pack-date')) {
+        console.log(`[webhook] order ${orderId}: pack date tag — skipped (re-enrichment attempt, tag already exists)`);
+      }
     }
   }
 

@@ -57,8 +57,8 @@ function hasSellingPlan(order) {
 }
 
 // The two date tags, read off whatever dates the order already carries.
-// onlyIfMissing: only add pack date tag if it doesn't already exist (prevents duplicates on subsequent enrichments)
-function dateTags(order, { onlyIfMissing = false } = {}) {
+// firstEnrichmentOnly: only add pack date tag on first enrichment, not on re-enrichment attempts
+function dateTags(order, { firstEnrichmentOnly = false } = {}) {
   const delivery =
     getNoteAttribute(order, 'Delivery-Date') || getNoteAttribute(order, 'HDS Delivery Date');
   const pack =
@@ -69,10 +69,11 @@ function dateTags(order, { onlyIfMissing = false } = {}) {
   const deliveryTag = delivery ? deliveryDateTag(normalizeDate(delivery)) : null;
   const packTag = pack ? packDateTag(normalizeDate(pack)) : null;
 
-  // If onlyIfMissing, only include pack tag if the order doesn't already have a Pack-Pack-Date tag
-  if (onlyIfMissing && packTag) {
+  // If firstEnrichmentOnly, skip pack date tag if it already exists (re-enrichment detection)
+  if (firstEnrichmentOnly && packTag) {
     const existingTags = String(order?.tags || '').toLowerCase();
     if (existingTags.includes('pick-pack-date')) {
+      // Order already has a pack date tag → this is a re-enrichment attempt
       return [deliveryTag].filter(Boolean);
     }
   }
