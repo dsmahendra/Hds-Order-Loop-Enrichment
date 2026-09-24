@@ -31,7 +31,6 @@ const { resolveAdminToken } = require('../shopify-tokens');
 const { needsRewrite, locationFor } = require('../lib/renewal-rewrite');
 const { applyHdsToOrder, planFor, rewriteEnabled, hasDeliveryDate } = require('../lib/apply-hds');
 const { buildHdsAttributes } = require('../lib/renewal-date');
-const { notifyOrderStatus } = require('../lib/order-notify');
 
 function parseArgs(argv) {
   const opts = { refs: [] };
@@ -186,36 +185,11 @@ async function main() {
   const failures = [];
   for (const ref of opts.refs) {
     try {
-      const result = await runOne(ref, opts);
+      await runOne(ref, opts);
       ok += 1;
-
-      // Send order status notification for processed orders (unless dry-run).
-      // Fetch fresh order to ensure notifications see the latest state.
-      if ((result.written || result.skipped) && !opts.dryRun) {
-        try {
-          const label = ref.id || ref.name;
-          const order = ref.id ? (await getOrder(ref.id))?.order : await getOrderByName(ref.name);
-          if (order) {
-            await notifyOrderStatus(order, { force: true });
-          }
-        } catch (err) {
-          console.warn(`  (notification failed — ${err.message.split('\n')[0]})`);
-        }
-      }
     } catch (err) {
       failures.push(`${ref.id || ref.name}: ${err.message}`);
       console.error(`  ✗ ${err.message}`);
-
-      // Also send failure notification so admin knows about the failed attempt
-      try {
-        const label = ref.id || ref.name;
-        const order = ref.id ? (await getOrder(ref.id))?.order : await getOrderByName(ref.name);
-        if (order) {
-          await notifyOrderStatus(order, { force: true });
-        }
-      } catch (err2) {
-        // Best-effort: if notification fails, continue
-      }
     }
   }
 
