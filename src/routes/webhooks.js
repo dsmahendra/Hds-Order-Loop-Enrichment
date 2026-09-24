@@ -513,29 +513,38 @@ router.post('/shopify/orders/create', async (req, res) => {
         `[webhook] order ${orderId}: HDS data incomplete — flagged for the retry job`
       );
       // Send email alert for failed/incomplete orders
-      if (emailConfigured()) {
-        try {
-          const reason = errorMessage || 'Unknown reason';
-          await sendMail({
-            subject: `Order Enrichment Failed: ${order.name || orderId}`,
-            text: `Order: ${order.name || orderId} (ID: ${orderId})
+      try {
+        const reason = errorMessage || 'Unknown reason';
+        const emailResult = await sendMail({
+          subject: `[HDS] Order ${order.name || orderId} — enrichment failed`,
+          text: `Order: ${order.name || orderId} (ID: ${orderId})
 Created: ${order.created_at}
 Status: ${status}
 Source: ${source}
 
-Reason for failure:
+Reason:
 ${reason}
 
-Please investigate and resolve using:
-node src/scripts/order-fix.js --name ${order.name || orderId}
+Fix it with:
+  node src/scripts/order-fix.js --name ${order.name || orderId}
 
 Store: ${process.env.SHOPIFY_STORE || 'unknown'}`,
-          });
-        } catch (emailErr) {
+        });
+        if (emailResult.sent) {
+          console.log(
+            `[webhook] order ${orderId}: failure email sent to ${emailResult.to.join(', ')}` +
+              (emailResult.bcc?.length ? ` (bcc ${emailResult.bcc.join(', ')})` : '')
+          );
+        } else {
           console.warn(
-            `[webhook] order ${orderId}: failed to send email alert — ${describeError(emailErr)}`
+            `[webhook] order ${orderId}: failure email NOT sent — ${emailResult.reason}` +
+              `; configure SMTP_HOST, SMTP_USER, SMTP_PASS, ALERT_EMAIL_FROM, ALERT_EMAIL_TO to enable`
           );
         }
+      } catch (emailErr) {
+        console.warn(
+          `[webhook] order ${orderId}: failure email send failed — ${describeError(emailErr)}`
+        );
       }
     }
 
