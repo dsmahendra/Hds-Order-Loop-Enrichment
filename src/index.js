@@ -6,6 +6,7 @@ const shopifyOauth = require('./shopify-oauth');
 const { initQueueProcessor } = require('./jobs/enrich-orders-queue');
 const { initHdsRetry } = require('./jobs/retry-hds-writes');
 const { initPackDateSweep } = require('./jobs/sweep-missing-packdates');
+const { initPackdateChecker } = require('./jobs/check-stale-packdates');
 const { initAlertDigest } = require('./jobs/alert-digest');
 const { applySchema } = require('./db-bootstrap');
 
@@ -41,6 +42,10 @@ app.listen(PORT, async () => {
   // Last line of defence, and the only one that does not depend on the webhook
   // having arrived or on our queue holding a row for the order.
   initPackDateSweep();
+
+  // Real-time health check: scan for missing/stale pack dates every 5 minutes.
+  // Sends detailed email report to admins. Optional: disabled if CHECK_PACKDATES_ENABLED=false.
+  initPackdateChecker();
 
   // Email admin a periodic summary of anything still outstanding. Optional:
   // does nothing but log without SMTP configured.
