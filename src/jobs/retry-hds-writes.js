@@ -14,6 +14,7 @@
 const { pool } = require('../db');
 const { getOrder } = require('../shopify');
 const { applyHdsToOrder } = require('../lib/apply-hds');
+const { notifyOrderStatus } = require('../lib/order-notify');
 
 // Slow on purpose: this is a safety net, not the main path. The webhook handles
 // the normal case within a second of the order existing. But a Loop renewal
@@ -84,6 +85,16 @@ async function retryOne(row) {
         `[ALERT][retry] order ${orderId}: giving up after ${attemptsMade} attempts — ${out.reason} ` +
           `(needs a manual fix, e.g. node src/scripts/order-fix.js --order ${orderId})`
       );
+
+      // Send failure notification when giving up on an order
+      try {
+        const order = (await getOrder(orderId))?.order;
+        if (order) {
+          await notifyOrderStatus(order, { force: true });
+        }
+      } catch (err) {
+        console.warn(`[retry] order ${orderId}: could not send failure notification — ${err.message.split('\n')[0]}`);
+      }
     } else {
       console.warn(`[retry] order ${orderId}: still failing (attempt ${attemptsMade}/${MAX_ATTEMPTS}) — ${out.reason}`);
     }
