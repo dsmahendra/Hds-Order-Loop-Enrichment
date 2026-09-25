@@ -28,19 +28,26 @@ const MAX_ATTEMPTS = Number(process.env.HDS_RETRY_MAX_ATTEMPTS || 6);
 let running = false;
 
 // Rows the webhook left incomplete. 'skipped' covers a held order and one whose
-// rewrite failed; 'failed' covers an exhausted enrichment. Oldest first, so a
-// backlog drains in the order it accumulated.
+// rewrite failed; 'failed' covers an exhausted enrichment.
 //
 // hds_write_ok = FALSE is the case those two statuses missed entirely: the order
 // HAD a delivery date, so it was queued 'pending' and enriched normally, but the
 // write of the pack date onto the Shopify order did not land. Status alone could
 // not tell that apart from success, so nothing ever retried it.
+//
+// PRIORITIZE new orders (created < 10 minutes ago) first to catch transient
+// HDS outages quickly, then fall back to older orders. Fresh failures are more
+// likely to be fixable (HDS back online) than stale ones stuck on configuration.
 const SELECT_PENDING = `
   SELECT order_id, status, attempts, error_message, hds_write_ok
     FROM orders_to_enrich
    WHERE (status IN ('skipped', 'failed') OR hds_write_ok = FALSE)
      AND attempts < $1
-   ORDER BY id ASC
+   ORDER BY CASE
+              WHEN created_at >= NOW() - INTERVAL '10 minutes' THEN 0
+              ELSE 1
+            END,
+            created_at DESC
    LIMIT $2
 `;
 
