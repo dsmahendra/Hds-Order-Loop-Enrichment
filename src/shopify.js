@@ -281,10 +281,23 @@ async function getOrderByName(name) {
 // The Admin API REPLACES note_attributes wholesale, so sending only our keys
 // would delete Delivery-Time, Custom-Attribute-*, _amp_sc and everything else the
 // order carries. Existing entries keep their position; new keys are appended.
+//
+// IMPORTANT: Only remove attributes that are being replaced by a new attribute
+// in the updates. Don't remove attributes we're not replacing, as they may be
+// authoritative data from another process.
 function mergeNoteAttributes(existing, updates, removeNames = []) {
   const drop = new Set(removeNames);
   const out = (Array.isArray(existing) ? existing : [])
-    .filter((a) => !drop.has(a?.name))
+    .filter((a) => {
+      // Don't remove attributes that aren't being replaced by updates
+      if (!drop.has(a?.name)) return true;
+      // Only drop if we have a replacement in updates (case-insensitive match)
+      const name = a?.name;
+      return !Object.keys(updates || {}).some(
+        (updateKey) => updateKey.toLowerCase().replace(/\s+/g, '_').replace(/-/g, '_') ===
+                       name.toLowerCase().replace(/\s+/g, '_').replace(/-/g, '_')
+      );
+    })
     .map((a) => ({ name: a?.name, value: a?.value }));
   for (const [name, value] of Object.entries(updates || {})) {
     if (value === null || value === undefined || value === '') continue;
