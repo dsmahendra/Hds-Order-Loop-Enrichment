@@ -276,6 +276,14 @@ async function getOrderByName(name) {
   return data?.orders?.[0] || null;
 }
 
+// Normalize attribute name for comparison (handle spaces, dashes, case)
+function normalizeAttributeName(name) {
+  return String(name || '')
+    .toLowerCase()
+    .replace(/\s+/g, '_')
+    .replace(/-/g, '_');
+}
+
 // Merge updates into an order's existing note_attributes.
 //
 // The Admin API REPLACES note_attributes wholesale, so sending only our keys
@@ -284,24 +292,25 @@ async function getOrderByName(name) {
 //
 // IMPORTANT: Only remove attributes that are being replaced by a new attribute
 // in the updates. Don't remove attributes we're not replacing, as they may be
-// authoritative data from another process.
+// authoritative data from another process (checkout extension, etc).
 function mergeNoteAttributes(existing, updates, removeNames = []) {
-  const drop = new Set(removeNames);
+  const drop = new Set(removeNames.map(normalizeAttributeName));
+  const updateKeys = new Set(Object.keys(updates || {}).map(normalizeAttributeName));
+
   const out = (Array.isArray(existing) ? existing : [])
     .filter((a) => {
-      // Don't remove attributes that aren't being replaced by updates
-      if (!drop.has(a?.name)) return true;
-      // Only drop if we have a replacement in updates (case-insensitive match)
-      const name = a?.name;
-      return !Object.keys(updates || {}).some(
-        (updateKey) => updateKey.toLowerCase().replace(/\s+/g, '_').replace(/-/g, '_') ===
-                       name.toLowerCase().replace(/\s+/g, '_').replace(/-/g, '_')
-      );
+      const attrName = normalizeAttributeName(a?.name);
+      // Keep attribute if it's not in the removal list
+      if (!drop.has(attrName)) return true;
+      // If in removal list, only REMOVE if we have a replacement in updates
+      // Otherwise keep it (another process may own it)
+      return !updateKeys.has(attrName);
     })
     .map((a) => ({ name: a?.name, value: a?.value }));
+
   for (const [name, value] of Object.entries(updates || {})) {
     if (value === null || value === undefined || value === '') continue;
-    const hit = out.find((a) => a.name === name);
+    const hit = out.find((a) => normalizeAttributeName(a.name) === normalizeAttributeName(name));
     if (hit) hit.value = String(value);
     else out.push({ name, value: String(value) });
   }
