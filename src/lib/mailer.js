@@ -55,20 +55,26 @@ function transport() {
   return cachedTransport;
 }
 
-// { subject, text }. Silently does nothing when SMTP isn't configured — the
-// caller decides whether that's worth its own log line.
-async function sendMail({ subject, text }) {
+// { subject, text, to? }. Silently does nothing when SMTP isn't configured.
+// to: optional custom recipient list (overrides config().to if provided)
+async function sendMail({ subject, text, to = null }) {
   if (!isConfigured()) return { sent: false, reason: 'SMTP not configured' };
 
   const c = config();
+  const recipients = to || c.to;
+
+  if (!recipients || recipients.length === 0) {
+    return { sent: false, reason: 'No recipients configured' };
+  }
+
   await transport().sendMail({
     from: c.from,
-    to: c.to.join(', '),
+    to: (Array.isArray(recipients) ? recipients : [recipients]).join(', '),
     ...(c.bcc.length ? { bcc: c.bcc.join(', ') } : {}),
     subject,
     text,
   });
-  return { sent: true, to: c.to, bcc: c.bcc };
+  return { sent: true, to: Array.isArray(recipients) ? recipients : [recipients], bcc: c.bcc };
 }
 
 module.exports = { isConfigured, sendMail, config };

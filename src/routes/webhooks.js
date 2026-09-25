@@ -515,9 +515,27 @@ router.post('/shopify/orders/create', async (req, res) => {
       // Send email alert for failed/incomplete orders
       try {
         const reason = errorMessage || 'Unknown reason';
-        const emailResult = await sendMail({
-          subject: `[HDS] Order ${order.name || orderId} — enrichment failed`,
-          text: `Order: ${order.name || orderId} (ID: ${orderId})
+        const config = require('../lib/mailer').config();
+
+        // Build recipient list: primary alerts + admin failures list
+        const recipients = new Set(config.to || []);
+        const failureAdmins = String(process.env.FAILURE_EMAIL_ADMINS || '')
+          .split(',')
+          .map(e => e.trim())
+          .filter(Boolean);
+        failureAdmins.forEach(e => recipients.add(e));
+
+        if (recipients.size === 0) {
+          console.warn(
+            `[webhook] order ${orderId}: failure email NOT sent — ` +
+            `set ALERT_EMAIL_TO or FAILURE_EMAIL_ADMINS to enable failure notifications`
+          );
+        } else {
+          const emailResult = await sendMail({
+            subject: `[HDS] Order ${order.name || orderId} — enrichment FAILED`,
+            text: `⚠️ ORDER ENRICHMENT FAILED
+
+Order: ${order.name || orderId} (ID: ${orderId})
 Created: ${order.created_at}
 Status: ${status}
 Source: ${source}
@@ -529,17 +547,18 @@ Fix it with:
   node src/scripts/order-fix.js --name ${order.name || orderId}
 
 Store: ${process.env.SHOPIFY_STORE || 'unknown'}`,
-        });
-        if (emailResult.sent) {
-          console.log(
-            `[webhook] order ${orderId}: failure email sent to ${emailResult.to.join(', ')}` +
-              (emailResult.bcc?.length ? ` (bcc ${emailResult.bcc.join(', ')})` : '')
-          );
-        } else {
-          console.warn(
-            `[webhook] order ${orderId}: failure email NOT sent — ${emailResult.reason}` +
-              `; configure SMTP_HOST, SMTP_USER, SMTP_PASS, ALERT_EMAIL_FROM, ALERT_EMAIL_TO to enable`
-          );
+            to: Array.from(recipients)
+          });
+          if (emailResult.sent) {
+            console.log(
+              `[webhook] order ${orderId}: failure email sent to ${emailResult.to.join(', ')}` +
+                (emailResult.bcc?.length ? ` (bcc ${emailResult.bcc.join(', ')})` : '')
+            );
+          } else {
+            console.warn(
+              `[webhook] order ${orderId}: failure email NOT sent — ${emailResult.reason}`
+            );
+          }
         }
       } catch (emailErr) {
         console.warn(
