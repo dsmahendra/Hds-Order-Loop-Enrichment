@@ -653,9 +653,10 @@ async function rewriteRenewalOrder(order, { dryRun = false, subscriptionAttribut
     removeTagPrefixes: mayRemoveSupersededTags()
       ? [PACK_TAG_PREFIX, HELD_TAG, ...staleDateTags]
       : [HELD_TAG],
-    // Keep ALL capitalized attributes alongside new lowercase ones
-    // Do NOT delete Pick-Pack-Date, HDS Delivery Date, etc.
-    removeAttributes: [],
+    // Only remove 'HDS Pack Date' (which we're replacing with 'HDS Ship Date')
+    // Do NOT remove capitalized HDS attributes like 'Pick-Pack-Date', 'HDS Delivery Date'
+    // as they may have been written by an earlier process and we want to keep them
+    removeAttributes: SUPERSEDED_ATTRIBUTES,
     order,
   });
 
