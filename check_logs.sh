@@ -1,0 +1,10 @@
+#!/bin/bash
+echo "Checking Railway logs for webhook activity in the last 30 minutes..."
+echo ""
+echo "Connect to Railway and run:"
+echo "railway logs --follow"
+echo ""
+echo "Look for patterns like:"
+echo "  [webhook] order created"
+echo "  [enrich-orders-queue]"
+echo "  hds_write_ok"

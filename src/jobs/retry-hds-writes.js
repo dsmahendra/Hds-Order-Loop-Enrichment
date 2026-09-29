@@ -44,6 +44,7 @@ const SELECT_PENDING = `
     FROM orders_to_enrich
    WHERE (status IN ('skipped', 'failed') OR hds_write_ok = FALSE)
      AND attempts < $1
+     AND created_at >= CURRENT_DATE
    ORDER BY CASE
               WHEN created_at >= NOW() - INTERVAL '10 minutes' THEN 0
               ELSE 1

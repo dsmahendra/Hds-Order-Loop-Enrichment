@@ -97,9 +97,11 @@ async function tick() {
   if (running) return;
   running = true;
   try {
+    // SAFETY: Only process orders created TODAY. Skip previous day orders entirely.
     const { rows } = await pool.query(
       `SELECT * FROM orders_to_enrich
         WHERE status = 'pending' AND attempts < $1
+          AND created_at >= CURRENT_DATE
         ORDER BY id ASC
         LIMIT $2`,
       [MAX_ATTEMPTS, BATCH_SIZE]

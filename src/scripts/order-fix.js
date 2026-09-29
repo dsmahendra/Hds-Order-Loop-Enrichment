@@ -85,6 +85,13 @@ async function runOne(ref, opts) {
   if (!order) throw new Error(`order ${label} not found in Shopify`);
   const orderId = order.id;
 
+  // SAFETY: Refuse to process orders created before today
+  const orderDate = String(order.created_at || '').slice(0, 10);
+  const todayDate = new Date().toISOString().slice(0, 10);
+  if (orderDate < todayDate) {
+    throw new Error(`order ${label} created on ${orderDate}, which is before today (${todayDate}) — use only for TODAY's orders`);
+  }
+
   const { postcode, suburb } = locationFor(order);
   const state = needsRewrite(order);
 
