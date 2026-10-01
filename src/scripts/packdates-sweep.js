@@ -40,6 +40,9 @@ try {
   fail(err.message);
 }
 
+// A hand run must not mark orders as 'checked' or email about them.
+process.env.SWEEP_CHECK_ONCE = 'false';
+
 // The job reads these at require time, so they must be set before it is loaded.
 if (opts.hours !== undefined) {
   if (!/^\d+(\.\d+)?$/.test(opts.hours)) fail(`--hours ${opts.hours} is not a number`);

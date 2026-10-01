@@ -1,5 +1,5 @@
-// The date watch emails once per distinct problem or change — not on every
-// sweep pass an order stays broken, and not for healthy orders it sees first.
+// Each order is checked ONCE and produces at most one email about it. Later
+// passes skip it, so nothing is repeated every few minutes.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -18,16 +18,16 @@ const healthy = (id, deliveryDays = 6, packDays = 4) =>
   order(id, { 'Delivery-Date': slash(deliveryDays), 'Pick-Pack-Date': slash(packDays) });
 
 function harness({ failSend = false } = {}) {
-  const store = new Map();
+  const store = new Set();
   const sent = [];
   const watch = createDateWatch({
     enabled: () => true,
     store: {
-      async load(ids) {
-        return new Map(ids.filter((i) => store.has(String(i))).map((i) => [String(i), store.get(String(i))]));
+      async checked(ids) {
+        return new Set(ids.map(String).filter((i) => store.has(i)));
       },
       async save(entries) {
-        for (const e of entries) store.set(String(e.id), e.snap);
+        for (const e of entries) store.add(String(e.id));
       },
     },
     send: async (mail) => {
@@ -39,71 +39,89 @@ function harness({ failSend = false } = {}) {
   return { watch, sent, store };
 }
 
-test('a healthy order seen for the first time is recorded silently', async () => {
-  const { watch, sent, store } = harness();
-  watch.observe(healthy(1));
+test('a healthy order is marked checked and produces no email', async () => {
+  const { watch, sent } = harness();
+  watch.begin(healthy(1));
   await watch.flush();
   assert.equal(sent.length, 0);
-  assert.ok(store.has('1'));
+  assert.deepEqual([...(await watch.alreadyChecked([1, 2]))], ['1']);
 });
 
-test('an order with no pack date is reported once, then not again while unchanged', async () => {
-  const { watch, sent } = harness();
-  const o = order(2, { 'Delivery-Date': slash(6) });
+test('once checked, an order is reported as already checked on every later pass', async () => {
+  const { watch } = harness();
+  watch.begin(order(2, { 'Delivery-Date': slash(6) }));
+  await watch.flush();
+  assert.ok((await watch.alreadyChecked([2])).has('2'));
+  assert.ok((await watch.alreadyChecked([2])).has('2'));
+});
 
-  watch.observe(o);
+test('an order still without a pack date after the check is reported as still wrong', async () => {
+  const { watch, sent } = harness();
+  watch.begin(order(3, { 'Delivery-Date': slash(6) }));
   await watch.flush();
   assert.equal(sent.length, 1);
-  assert.match(sent[0].text, /WM2/);
+  assert.match(sent[0].text, /STILL WRONG/);
+  assert.match(sent[0].text, /WM3/);
   assert.match(sent[0].text, /no pack date/);
-
-  watch.observe(o);
-  await watch.flush();
-  assert.equal(sent.length, 1, 'same problem must not be reported twice');
+  assert.match(sent[0].subject, /1 still wrong/);
 });
 
-test('a pack date in the past is reported as a problem', async () => {
+test('a pack date in the past that is still past after the check is reported', async () => {
   const { watch, sent } = harness();
-  watch.observe(order(3, { 'Delivery-Date': slash(6), 'Pick-Pack-Date': slash(-5) }));
+  watch.begin(order(4, { 'Delivery-Date': slash(6), 'Pick-Pack-Date': slash(-5) }));
   await watch.flush();
   assert.equal(sent.length, 1);
   assert.match(sent[0].text, /on or before today/);
 });
 
-test('a changed pack or delivery date is reported with before and after', async () => {
+test('an order the check fixed is reported as auto-fixed with before and after', async () => {
   const { watch, sent } = harness();
-  watch.observe(healthy(4, 6, 4));
-  await watch.flush();
-  assert.equal(sent.length, 0);
-
-  watch.observe(healthy(4, 13, 11));
+  watch.begin(order(5, { 'Delivery-Date': slash(6) }));
+  watch.finish(healthy(5, 6, 4));
   await watch.flush();
   assert.equal(sent.length, 1);
-  assert.match(sent[0].text, new RegExp(`${slash(6).replace(/\//g, '-')}.*${slash(13).replace(/\//g, '-')}`));
-  assert.match(sent[0].subject, /1 change/);
+  assert.match(sent[0].text, /AUTO-FIXED/);
+  assert.match(sent[0].text, /\(none\)/);
+  assert.match(sent[0].subject, /0 still wrong, 1 auto-fixed/);
 });
 
-test('a problem that gets fixed produces a change notice, not a repeat problem', async () => {
+test('a date changed by the check on an order that was not flagged is reported as changed', async () => {
   const { watch, sent } = harness();
-  watch.observe(order(5, { 'Delivery-Date': slash(6) }));
-  await watch.flush(); // problem
-
-  watch.observe(healthy(5, 6, 4));
-  await watch.flush(); // pack date appeared
-  assert.equal(sent.length, 2);
-  assert.match(sent[1].subject, /0 problem\(s\), 1 change/);
+  watch.begin(healthy(6, 6, 4));
+  watch.finish(healthy(6, 13, 11));
+  await watch.flush();
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /CHANGED BY THE CHECK/);
 });
 
-test('a failed send leaves the state alone so the next pass tries again', async () => {
+test('one email per pass covers every order in it', async () => {
+  const { watch, sent } = harness();
+  watch.begin(order(7, { 'Delivery-Date': slash(6) }));
+  watch.begin(order(8, { 'Delivery-Date': slash(6) }));
+  watch.begin(healthy(9));
+  await watch.flush();
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].subject, /2 still wrong/);
+});
+
+test('a failed send still marks the order checked, so it is not repeated', async () => {
   const { watch, store } = harness({ failSend: true });
-  watch.observe(order(6, { 'Delivery-Date': slash(6) }));
-  const out = await watch.flush();
-  assert.equal(out.sent, false);
-  assert.equal(store.has('6'), false);
+  watch.begin(order(10, { 'Delivery-Date': slash(6) }));
+  await watch.flush();
+  assert.ok(store.has('10'));
+});
+
+test('an ephemeral watch remembers nothing and sends nothing', async () => {
+  const sent = [];
+  const watch = createDateWatch({ ephemeral: true, send: async (m) => sent.push(m) });
+  watch.begin(order(11, { 'Delivery-Date': slash(6) }));
+  await watch.flush();
+  assert.equal(sent.length, 0);
+  assert.equal((await watch.alreadyChecked([11])).size, 1, 'memory within the run only');
 });
 
 test('snapshotOf reads pack and delivery from either label', () => {
-  const s = snapshotOf(order(7, { 'HDS Delivery Date': slash(6), 'HDS Ship Date': slash(4) }));
+  const s = snapshotOf(order(12, { 'HDS Delivery Date': slash(6), 'HDS Ship Date': slash(4) }));
   assert.ok(s.pack);
   assert.ok(s.delivery);
   assert.equal(s.issue, null);

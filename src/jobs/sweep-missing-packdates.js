@@ -27,8 +27,13 @@ const { HELD_TAG } = require('../lib/renewal-rewrite');
 const { missingTags, taggingEnabled } = require('../lib/order-tags');
 const { createDateWatch } = require('../lib/date-alerts');
 
-// Emails admin about missing/past pack dates and date changes on today's orders.
-const dateWatch = createDateWatch();
+// Remembers which orders have had their one check, and emails what it found.
+// SWEEP_CHECK_ONCE=false (set by the manual `packdates:sweep` script) uses a watch
+// that remembers nothing and sends nothing, so a hand run neither skips orders
+// nor uses up their scheduled check.
+const dateWatch = createDateWatch({
+  ephemeral: String(process.env.SWEEP_CHECK_ONCE || 'true').toLowerCase() === 'false',
+});
 
 const INTERVAL_MS = Number(process.env.SWEEP_INTERVAL_MS || 5 * 60 * 1000);
 const WINDOW_HOURS = Number(process.env.SWEEP_HOURS || 24);
@@ -36,23 +41,13 @@ const WINDOW_HOURS = Number(process.env.SWEEP_HOURS || 24);
 // An order created seconds ago is probably still in the webhook handler, and the
 // checkout extension may still be writing its own attributes onto it. Fixing it
 // here too would double every write and can lose to that second writer, so wait
-// until both have had their say. This is the "check again ~5 minutes after the
-// order" pass: an order is first judged once it is this old.
+// until both have had their say. An order is checked ONCE, the first pass after
+// it is this old, and never again (see lib/date-alerts.js).
 const MIN_AGE_MINUTES = Number(process.env.SWEEP_MIN_AGE_MINUTES || 5);
 
 // Only orders created today (same rule as the other scripts' safety guard).
 // Anything older is left for a person to look at on purpose.
 const TODAY_ONLY = String(process.env.SWEEP_TODAY_ONLY || 'true').toLowerCase() !== 'false';
-
-// Writes per order, per process lifetime, before the sweep stops touching it.
-// What went wrong before was an order the sweep "fixed" every pass and never
-// finished — each pass was another edit on the order's timeline. A correct fix
-// converges after one pass; an order that is still wrong after this many is one
-// the sweep cannot fix, and a person is told instead of the order being rewritten
-// forever.
-const MAX_ATTEMPTS = Number(process.env.SWEEP_MAX_ATTEMPTS || 3);
-const attempts = new Map(); // order id -> passes that tried to fix it
-const alerted = new Set(); // order ids already reported as given up on
 
 // A bound on one pass. If something systemic broke and hundreds of orders need
 // fixing, repairing them over several passes is better than spending the whole
@@ -126,7 +121,8 @@ async function sweep() {
   let tooNew = 0;
   let held = 0;
   let previousDay = 0;
-  let gaveUp = 0;
+  let alreadyDone = 0;
+  const eligible = [];
   const candidates = [];
   const todayIso = new Date().toISOString().slice(0, 10);
 
@@ -153,40 +149,39 @@ async function sweep() {
         previousDay += 1;
         continue;
       }
-      dateWatch.observe(order);
       if (isHeld(order)) {
         held += 1;
         continue;
       }
-
-      const work = needsWork(order);
-      if (!work) continue;
-
-      if ((attempts.get(order.id) || 0) >= MAX_ATTEMPTS) {
-        gaveUp += 1;
-        if (!alerted.has(order.id)) {
-          alerted.add(order.id);
-          console.warn(
-            `[ALERT][sweep] ${order.name || order.id}: still incomplete after ${MAX_ATTEMPTS} attempts — ` +
-              `giving up on it, needs a manual look (${work.why})`
-          );
-        }
-        continue;
-      }
-      candidates.push({ order, ...work });
+      eligible.push(order);
     }
   } while (pageInfo);
 
-  // One email for anything new or changed since the last pass. Never throws.
-  await dateWatch.flush();
+  // Each order gets ONE check, the first pass it is old enough. Anything already
+  // checked is skipped outright: no judgement, no write, no email. A check that
+  // found nothing wrong counts too.
+  const checked = await dateWatch.alreadyChecked(eligible.map((o) => o.id));
+  for (const order of eligible) {
+    if (checked.has(String(order.id))) {
+      alreadyDone += 1;
+      continue;
+    }
+    const work = needsWork(order);
+    if (!work) {
+      dateWatch.begin(order); // healthy: recorded as checked, nothing to say
+      continue;
+    }
+    candidates.push({ order, ...work });
+  }
 
   if (!candidates.length) {
+    await dateWatch.flush();
     console.log(
       `[sweep] ${scanned} order(s) in the last ${WINDOW_HOURS}h — all complete` +
         (tooNew ? `, ${tooNew} too new to judge` : '') +
         (held ? `, ${held} held` : '') +
         (previousDay ? `, ${previousDay} from before today skipped` : '') +
-        (gaveUp ? `, ${gaveUp} given up on` : '')
+        (alreadyDone ? `, ${alreadyDone} already checked` : '')
     );
     return { scanned, fixed: 0, failed: 0, candidates: 0 };
   }
@@ -207,11 +202,11 @@ async function sweep() {
       // so writing from a stale copy is how another writer's fields get erased.
       // Also catches an order someone else completed since the scan.
       const order = (await getOrder(listed.id))?.order || listed;
+      dateWatch.begin(order);
       if (!needsWork(order)) {
         await clearRetryFlag(order.id);
         continue;
       }
-      attempts.set(order.id, (attempts.get(order.id) || 0) + 1);
 
       // atCreation false: this runs long after the charge, so the subscription's
       // completed count no longer describes this order and a billing-cycle tag
@@ -229,6 +224,13 @@ async function sweep() {
       }
 
       fixed += 1;
+      // What the order looks like after the write, for the one email about it.
+      try {
+        const fresh = (await getOrder(order.id))?.order;
+        if (fresh) dateWatch.finish(fresh);
+      } catch {
+        // The email then reports the order as it was before the fix.
+      }
       const pack = out.wrote?.['Pick-Pack-Date'] || packDateOf(order) || null;
       console.log(
         `[sweep] ${label}: ${out.action} — ${why}` +
@@ -249,6 +251,8 @@ async function sweep() {
       }
     }
   }
+
+  await dateWatch.flush();
 
   console.log(`[sweep] pass done: ${fixed} fixed, ${failed} failed.`);
   return { scanned, fixed, failed, candidates: candidates.length };
