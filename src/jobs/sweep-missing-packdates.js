@@ -21,18 +21,34 @@
 // planFor and the date tags are computed from the order payload already in hand —
 // so a quiet pass is one or two page reads and nothing else.
 
-const { listOrders, getNoteAttribute } = require('../shopify');
+const { listOrders, getOrder, getNoteAttribute } = require('../shopify');
 const { applyHdsToOrder, planFor } = require('../lib/apply-hds');
 const { HELD_TAG } = require('../lib/renewal-rewrite');
 const { missingTags, taggingEnabled } = require('../lib/order-tags');
 
-const INTERVAL_MS = Number(process.env.SWEEP_INTERVAL_MS || 15 * 60 * 1000);
+const INTERVAL_MS = Number(process.env.SWEEP_INTERVAL_MS || 5 * 60 * 1000);
 const WINDOW_HOURS = Number(process.env.SWEEP_HOURS || 24);
 
-// An order created seconds ago is probably still in the webhook handler. Fixing
-// it here too would double every write during a burst — exactly when the API
-// budget matters most — so give the handler first go.
-const MIN_AGE_MINUTES = Number(process.env.SWEEP_MIN_AGE_MINUTES || 10);
+// An order created seconds ago is probably still in the webhook handler, and the
+// checkout extension may still be writing its own attributes onto it. Fixing it
+// here too would double every write and can lose to that second writer, so wait
+// until both have had their say. This is the "check again ~5 minutes after the
+// order" pass: an order is first judged once it is this old.
+const MIN_AGE_MINUTES = Number(process.env.SWEEP_MIN_AGE_MINUTES || 5);
+
+// Only orders created today (same rule as the other scripts' safety guard).
+// Anything older is left for a person to look at on purpose.
+const TODAY_ONLY = String(process.env.SWEEP_TODAY_ONLY || 'true').toLowerCase() !== 'false';
+
+// Writes per order, per process lifetime, before the sweep stops touching it.
+// What went wrong before was an order the sweep "fixed" every pass and never
+// finished — each pass was another edit on the order's timeline. A correct fix
+// converges after one pass; an order that is still wrong after this many is one
+// the sweep cannot fix, and a person is told instead of the order being rewritten
+// forever.
+const MAX_ATTEMPTS = Number(process.env.SWEEP_MAX_ATTEMPTS || 3);
+const attempts = new Map(); // order id -> passes that tried to fix it
+const alerted = new Set(); // order ids already reported as given up on
 
 // A bound on one pass. If something systemic broke and hundreds of orders need
 // fixing, repairing them over several passes is better than spending the whole
@@ -105,7 +121,10 @@ async function sweep() {
   let scanned = 0;
   let tooNew = 0;
   let held = 0;
+  let previousDay = 0;
+  let gaveUp = 0;
   const candidates = [];
+  const todayIso = new Date().toISOString().slice(0, 10);
 
   do {
     const res = await listOrders({
@@ -126,13 +145,30 @@ async function sweep() {
         tooNew += 1;
         continue;
       }
+      if (TODAY_ONLY && String(order.created_at || '').slice(0, 10) < todayIso) {
+        previousDay += 1;
+        continue;
+      }
       if (isHeld(order)) {
         held += 1;
         continue;
       }
 
       const work = needsWork(order);
-      if (work) candidates.push({ order, ...work });
+      if (!work) continue;
+
+      if ((attempts.get(order.id) || 0) >= MAX_ATTEMPTS) {
+        gaveUp += 1;
+        if (!alerted.has(order.id)) {
+          alerted.add(order.id);
+          console.warn(
+            `[ALERT][sweep] ${order.name || order.id}: still incomplete after ${MAX_ATTEMPTS} attempts — ` +
+              `giving up on it, needs a manual look (${work.why})`
+          );
+        }
+        continue;
+      }
+      candidates.push({ order, ...work });
     }
   } while (pageInfo);
 
@@ -140,7 +176,9 @@ async function sweep() {
     console.log(
       `[sweep] ${scanned} order(s) in the last ${WINDOW_HOURS}h — all complete` +
         (tooNew ? `, ${tooNew} too new to judge` : '') +
-        (held ? `, ${held} held` : '')
+        (held ? `, ${held} held` : '') +
+        (previousDay ? `, ${previousDay} from before today skipped` : '') +
+        (gaveUp ? `, ${gaveUp} given up on` : '')
     );
     return { scanned, fixed: 0, failed: 0, candidates: 0 };
   }
@@ -153,9 +191,20 @@ async function sweep() {
   let fixed = 0;
   let failed = 0;
 
-  for (const { order, why } of candidates.slice(0, MAX_FIXES)) {
-    const label = order.name || order.id;
+  for (const { order: listed, why } of candidates.slice(0, MAX_FIXES)) {
+    const label = listed.name || listed.id;
     try {
+      // Judge and write against the order as it is NOW, not as the list page saw
+      // it moments ago. Shopify replaces the whole attribute list on every write,
+      // so writing from a stale copy is how another writer's fields get erased.
+      // Also catches an order someone else completed since the scan.
+      const order = (await getOrder(listed.id))?.order || listed;
+      if (!needsWork(order)) {
+        await clearRetryFlag(order.id);
+        continue;
+      }
+      attempts.set(order.id, (attempts.get(order.id) || 0) + 1);
+
       // atCreation false: this runs long after the charge, so the subscription's
       // completed count no longer describes this order and a billing-cycle tag
       // taken from it would be wrong.
