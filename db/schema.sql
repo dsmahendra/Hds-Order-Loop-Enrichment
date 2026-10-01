@@ -156,3 +156,14 @@ CREATE TABLE IF NOT EXISTS alert_digest_runs (
   id     SERIAL PRIMARY KEY,
   ran_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- What the date watch (lib/date-alerts.js) last saw for each order: delivery
+-- date, pack date and the problem, if any. Lets it email once per distinct
+-- problem or change instead of on every sweep pass, and survive a restart.
+CREATE TABLE IF NOT EXISTS order_date_watch (
+  order_id      BIGINT PRIMARY KEY,
+  delivery_date TEXT,
+  pack_date     TEXT,
+  issue         TEXT,
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

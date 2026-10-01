@@ -25,6 +25,10 @@ const { listOrders, getOrder, getNoteAttribute } = require('../shopify');
 const { applyHdsToOrder, planFor } = require('../lib/apply-hds');
 const { HELD_TAG } = require('../lib/renewal-rewrite');
 const { missingTags, taggingEnabled } = require('../lib/order-tags');
+const { createDateWatch } = require('../lib/date-alerts');
+
+// Emails admin about missing/past pack dates and date changes on today's orders.
+const dateWatch = createDateWatch();
 
 const INTERVAL_MS = Number(process.env.SWEEP_INTERVAL_MS || 5 * 60 * 1000);
 const WINDOW_HOURS = Number(process.env.SWEEP_HOURS || 24);
@@ -149,6 +153,7 @@ async function sweep() {
         previousDay += 1;
         continue;
       }
+      dateWatch.observe(order);
       if (isHeld(order)) {
         held += 1;
         continue;
@@ -171,6 +176,9 @@ async function sweep() {
       candidates.push({ order, ...work });
     }
   } while (pageInfo);
+
+  // One email for anything new or changed since the last pass. Never throws.
+  await dateWatch.flush();
 
   if (!candidates.length) {
     console.log(

@@ -73,4 +73,4 @@ async function notifyOrderStatus(order, { force = false } = {}) {
   }
 }
 
-module.exports = { notifyOrderStatus, isEnabled };
+module.exports = { notifyOrderStatus, isEnabled, orderUrl };
