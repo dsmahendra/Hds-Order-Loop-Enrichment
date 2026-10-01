@@ -167,3 +167,19 @@ CREATE TABLE IF NOT EXISTS order_date_watch (
   issue         TEXT,
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Per-order audit trail (lib/order-audit.js): what the checkout sent, every
+-- change the backend made afterwards (before -> after), and what the sweep's one
+-- check found. Read it back with `npm run order:audit -- --name WM146416`.
+CREATE TABLE IF NOT EXISTS order_audit_log (
+  id         BIGSERIAL PRIMARY KEY,
+  order_id   BIGINT NOT NULL,
+  order_name TEXT,
+  stage      TEXT NOT NULL,
+  source     TEXT,
+  detail     JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS order_audit_log_order_idx ON order_audit_log (order_id, created_at);
+CREATE INDEX IF NOT EXISTS order_audit_log_name_idx ON order_audit_log (order_name);
+CREATE INDEX IF NOT EXISTS order_audit_log_created_idx ON order_audit_log (created_at);

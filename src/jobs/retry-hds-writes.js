@@ -15,6 +15,7 @@ const { pool } = require('../db');
 const { getOrder } = require('../shopify');
 const { applyHdsToOrder } = require('../lib/apply-hds');
 const { notifyOrderStatus } = require('../lib/order-notify');
+const audit = require('../lib/order-audit');
 
 // Slow on purpose: this is a safety net, not the main path. The webhook handles
 // the normal case within a second of the order existing. But a Loop renewal
@@ -66,6 +67,7 @@ async function retryOne(row) {
   // If hds_write_ok is FALSE/NULL, the webhook write failed, so attempt to write again.
   const skipShopifyWrite = row.hds_write_ok === true || row.hds_write_ok === 1;
 
+  audit.setSource('retry');
   const out = await applyHdsToOrder(order, { atCreation: false, dryRun: skipShopifyWrite });
 
   if (!out.ok) {

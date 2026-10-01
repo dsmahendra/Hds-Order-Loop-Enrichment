@@ -27,6 +27,7 @@ const { missingTags, taggingEnabled, hasSellingPlan } = require('../lib/order-ta
 const { buildHdsAttributes } = require('../lib/renewal-date');
 const { legacyLabelUpdates, describeUpdates, isEnabled: renameEnabled } = require('../lib/legacy-labels');
 const { notifyOrderStatus, isEnabled: perOrderEmailEnabled } = require('../lib/order-notify');
+const audit = require('../lib/order-audit');
 const { updateOrderAttributes, getOrder } = require('../shopify');
 const { sendMail, isConfigured: emailConfigured } = require('../lib/mailer');
 
@@ -108,6 +109,11 @@ router.post('/shopify/orders/create', async (req, res) => {
   const deliveryDate = rawDeliveryDate ? normalizeDate(rawDeliveryDate) : null;
 
   const source = isLoopOrder(order) ? 'loop' : 'checkout';
+
+  // Audit trail: the order exactly as it arrived, before anything of ours touches
+  // it, and every write below is attributed to the webhook.
+  audit.setSource('webhook');
+  audit.recordCheckout(order, { order_source: source });
 
   const postcode =
     firstAttribute(order, ['HDS Postcode', 'hds_postcode', 'Delivery-Location-Id']) ||
@@ -512,6 +518,12 @@ router.post('/shopify/orders/create', async (req, res) => {
       console.warn(
         `[webhook] order ${orderId}: HDS data incomplete — flagged for the retry job`
       );
+      audit.record({
+        order,
+        stage: 'backend_failed',
+        source: 'webhook',
+        detail: { reason: errorMessage || 'HDS data incomplete', note: 'webhook could not complete the HDS data' },
+      });
       // Send email alert for failed/incomplete orders
       try {
         const reason = errorMessage || 'Unknown reason';

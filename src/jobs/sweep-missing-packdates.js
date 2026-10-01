@@ -26,6 +26,7 @@ const { applyHdsToOrder, planFor } = require('../lib/apply-hds');
 const { HELD_TAG } = require('../lib/renewal-rewrite');
 const { missingTags, taggingEnabled } = require('../lib/order-tags');
 const { createDateWatch } = require('../lib/date-alerts');
+const audit = require('../lib/order-audit');
 
 // Remembers which orders have had their one check, and emails what it found.
 // SWEEP_CHECK_ONCE=false (set by the manual `packdates:sweep` script) uses a watch
@@ -112,6 +113,8 @@ async function clearRetryFlag(orderId) {
 }
 
 async function sweep() {
+  audit.setSource('sweep');
+  audit.prune(); // drop audit rows past AUDIT_RETENTION_DAYS; best effort
   const now = Date.now();
   const since = new Date(now - WINDOW_HOURS * 3600 * 1000).toISOString();
   const newestAllowed = now - MIN_AGE_MINUTES * 60 * 1000;
@@ -169,6 +172,7 @@ async function sweep() {
     const work = needsWork(order);
     if (!work) {
       dateWatch.begin(order); // healthy: recorded as checked, nothing to say
+      audit.recordCheck(order, 'ok — nothing to fix');
       continue;
     }
     candidates.push({ order, ...work });
@@ -203,7 +207,11 @@ async function sweep() {
       // Also catches an order someone else completed since the scan.
       const order = (await getOrder(listed.id))?.order || listed;
       dateWatch.begin(order);
-      if (!needsWork(order)) {
+      const stillNeeds = needsWork(order);
+      audit.recordCheck(order, stillNeeds ? `needs work — ${stillNeeds.why}` : 'ok — completed by something else', {
+        attempted_fix: Boolean(stillNeeds),
+      });
+      if (!stillNeeds) {
         await clearRetryFlag(order.id);
         continue;
       }
@@ -215,6 +223,7 @@ async function sweep() {
 
       if (!out.ok) {
         failed += 1;
+        audit.record({ order, stage: 'backend_failed', detail: { reason: out.reason, action: out.action, was: why } });
         // [ALERT]: one searchable tag across every job (this one, the retry
         // job, a held renewal) so "is anything broken right now" is one log
         // search rather than knowing each job's own prefix. Still logged here
@@ -241,6 +250,7 @@ async function sweep() {
     } catch (err) {
       failed += 1;
       const reason = (err.message || String(err)).split('\n')[0];
+      audit.record({ order: listed, stage: 'backend_failed', detail: { reason, was: why } });
       console.warn(`[ALERT][sweep] ${label}: ${reason}`);
 
       // Credentials or scopes fail identically for every remaining order, so stop

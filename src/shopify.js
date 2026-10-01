@@ -357,7 +357,18 @@ async function updateOrderAttributes(
     payload.order.tags = mergeTags(existing?.tags, addTags, removeTagPrefixes);
   }
 
-  return shopifyRequest('PUT', `/orders/${orderId}.json`, payload);
+  const result = await shopifyRequest('PUT', `/orders/${orderId}.json`, payload);
+
+  // Audit trail: what this write changed, before -> after. Recorded only once the
+  // write has succeeded, and never allowed to affect it.
+  require('./lib/order-audit').recordWrite({
+    order: { id: orderId, name: existing?.name },
+    existing,
+    afterAttributes: payload.order.note_attributes,
+    afterTags: payload.order.tags,
+  });
+
+  return result;
 }
 
 // Push enriched data onto the Shopify order as a metafield (non-destructive).

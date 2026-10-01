@@ -26,6 +26,7 @@
 // Needs SHOPIFY_STORE + SHOPIFY_ADMIN_TOKEN (write_orders) and HDS_API_BASE.
 
 require('dotenv').config();
+require('../lib/order-audit').setSource('order-fix');
 const { getOrder, getOrderByName, getNoteAttribute, describeAdminToken } = require('../shopify');
 const { resolveAdminToken } = require('../shopify-tokens');
 const { needsRewrite, locationFor } = require('../lib/renewal-rewrite');
