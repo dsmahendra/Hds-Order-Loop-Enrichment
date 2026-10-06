@@ -23,6 +23,7 @@
     "order:notify": "node src/scripts/order-notify-now.js",
     "order:audit": "node src/scripts/order-audit.js",
     "labels:rename": "node src/scripts/labels-rename.js",
+    "reorder:check": "node src/scripts/reorder-check.js",
     "test": "node --test \"test/*.test.js\""
   },
   "engines": {
