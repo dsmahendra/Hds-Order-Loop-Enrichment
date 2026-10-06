@@ -314,6 +314,22 @@ function mergeNoteAttributes(existing, updates, removeNames = []) {
     if (hit) hit.value = String(value);
     else out.push({ name, value: String(value) });
   }
+
+  // Sort attributes to put priority keys (dates) at the top, preserving all values
+  const PRIORITY_KEYS = [
+    'Delivery-Date',
+    'Delivery-Time',
+    'Pick-Pack-Date',
+    'HDS Production Date',
+    'HDS Delivery Date',
+    'HDS Ship Date',
+  ];
+  const getPriority = (attrName) => {
+    const idx = PRIORITY_KEYS.findIndex((k) => normalizeAttributeName(k) === normalizeAttributeName(attrName));
+    return idx === -1 ? 999 : idx;
+  };
+  out.sort((a, b) => getPriority(a.name) - getPriority(b.name));
+
   return out;
 }
 
