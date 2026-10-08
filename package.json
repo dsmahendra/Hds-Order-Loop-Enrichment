@@ -24,6 +24,7 @@
     "order:audit": "node src/scripts/order-audit.js",
     "labels:rename": "node src/scripts/labels-rename.js",
     "reorder:check": "node src/scripts/reorder-check.js",
+    "packdate:bulk": "node src/scripts/bulk-packdate-update.js",
     "test": "node --test \"test/*.test.js\""
   },
   "engines": {
